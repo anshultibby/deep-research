@@ -56,21 +56,15 @@ fi
 echo "🔄 Activating virtual environment..."
 source venv/bin/activate
 
-# Check if dependencies are installed
-echo "📦 Checking dependencies..."
-python -c "import fastapi, langgraph, litellm" 2>/dev/null
-if [ $? -ne 0 ]; then
-    echo "📦 Installing Python dependencies..."
-    pip install --upgrade pip
-    pip install -r requirements.txt
-    if [ $? -eq 0 ]; then
-        echo "✅ Dependencies installed"
-    else
-        echo "❌ Failed to install dependencies"
-        exit 1
-    fi
+# Install/update dependencies
+echo "📦 Installing dependencies..."
+pip install --upgrade pip -q
+pip install -r requirements.txt -q
+if [ $? -eq 0 ]; then
+    echo "✅ Dependencies ready"
 else
-    echo "✅ Dependencies OK"
+    echo "❌ Failed to install dependencies"
+    exit 1
 fi
 
 echo ""

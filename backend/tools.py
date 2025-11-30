@@ -13,8 +13,10 @@ import os
 import requests
 import functools
 from typing import List, Annotated, Callable, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
+from bs4 import BeautifulSoup
 import config  # Load environment variables
 from models import AgentContext
 
@@ -25,7 +27,7 @@ def tool_with_context(func: Callable) -> Callable:
     Wraps a function so:
     - It can accept 'context: AgentContext' parameter
     - Context is excluded from OpenAI schema
-    - Original @tool decorator still works for schema generation
+    - Actual execution receives context from tool_handlers
     
     Usage:
         @tool_with_context
@@ -34,19 +36,17 @@ def tool_with_context(func: Callable) -> Callable:
             context.add_sources(...)
             return Result(...)
     """
-    # Mark that this function needs context injection
-    func._needs_context = True
-    
-    # Create a wrapper for schema generation (without context parameter)
+    # Wrapper just calls the original function
+    # Context will be injected by tool_handlers before calling
     @functools.wraps(func)
-    def schema_wrapper(*args, **kwargs):
-        # Remove context from kwargs for schema generation
-        kwargs_no_context = {k: v for k, v in kwargs.items() if k != 'context'}
-        # This is for schema generation - actual execution goes through tool_handlers
-        return func(*args, **kwargs_no_context, context=None) if 'context' in func.__code__.co_varnames else func(*args, **kwargs_no_context)
+    def wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+    
+    # Mark wrapper that it needs context injection
+    wrapper._needs_context = True
     
     # Apply @tool decorator for LangChain
-    return tool(schema_wrapper)
+    return tool(wrapper)
 
 
 # Tool return models with display methods
@@ -56,16 +56,24 @@ class SearchResult(BaseModel):
     
     def __str__(self) -> str:
         if not self.results:
-            return "No results found."
+            return "<search_result>\n<status>No results found</status>\n</search_result>"
         
         if "error" in self.results[0]:
-            return self.results[0]["error"]
+            return f"<search_result>\n<error>{self.results[0]['error']}</error>\n</search_result>"
         
-        output = f"Found {len(self.results)} sources:\n\n"
-        for r in self.results:
-            output += f"• {r.get('title', 'No title')}\n"
-            output += f"  URL: {r.get('url', 'No URL')}\n"
-            output += f"  {r.get('content', 'No content')[:100]}...\n\n"
+        output = f"<search_result>\n<summary>Found {len(self.results)} sources</summary>\n\n"
+        for idx, r in enumerate(self.results, 1):
+            content = r.get('content', 'No content')
+            # Show up to 5,000 chars of content for the agent to read
+            truncated_content = content[:5000] if len(content) > 5000 else content
+            
+            output += f"<source id='{idx}'>\n"
+            output += f"<title>{r.get('title', 'No title')}</title>\n"
+            output += f"<url>{r.get('url', 'No URL')}</url>\n"
+            output += f"<content>\n{truncated_content}\n</content>\n"
+            output += f"</source>\n\n"
+        
+        output += "</search_result>"
         return output
 
 
@@ -75,9 +83,10 @@ class ClarificationRequest(BaseModel):
     questions: List[str] = Field(description="Clarifying questions")
     
     def __str__(self) -> str:
-        output = "Asking user for clarification:\n\n"
-        output += "\n".join([f"{i+1}. {q}" for i, q in enumerate(self.questions)])
-        output += "\n\n(Execution paused - waiting for user input)"
+        output = "<clarification_request>\n<message>Asking user for clarification</message>\n\n<questions>\n"
+        for i, q in enumerate(self.questions, 1):
+            output += f"<question id='{i}'>{q}</question>\n"
+        output += "</questions>\n\n<status>Execution paused - waiting for user input</status>\n</clarification_request>"
         return output
 
 
@@ -89,7 +98,11 @@ class ChecklistView(BaseModel):
     sources_count: int = Field(description="Number of sources discovered")
     
     def __str__(self) -> str:
-        return self.checklist_display
+        output = "<checklist_view>\n"
+        output += f"<summary>Total: {self.total_items} items | Completed: {self.completed_items} | Sources: {self.sources_count}</summary>\n\n"
+        output += f"<items>\n{self.checklist_display}\n</items>\n"
+        output += "</checklist_view>"
+        return output
 
 
 class ChecklistUpdate(BaseModel):
@@ -98,8 +111,10 @@ class ChecklistUpdate(BaseModel):
     items: List[str] = Field(description="Checklist items to add")
     
     def __str__(self) -> str:
-        output = "Updated checklist with new items:\n"
-        output += "\n".join([f"☐ {item}" for item in self.items])
+        output = "<checklist_update>\n<message>Updated checklist with new items</message>\n\n<new_items>\n"
+        for item in self.items:
+            output += f"<item status='pending'>☐ {item}</item>\n"
+        output += "</new_items>\n</checklist_update>"
         return output
 
 
@@ -110,7 +125,15 @@ class SubreportComplete(BaseModel):
     source_urls: List[str] = Field(description="Source URLs used")
     
     def __str__(self) -> str:
-        return f"✓ Completed {self.item_id}: Documented findings with {len(self.source_urls)} sources"
+        output = "<subreport_complete>\n"
+        output += f"<item_id>{self.item_id}</item_id>\n"
+        output += f"<status>✓ Completed</status>\n"
+        output += f"<findings>\n{self.findings}\n</findings>\n"
+        output += f"<sources count='{len(self.source_urls)}'>\n"
+        for url in self.source_urls:
+            output += f"<url>{url}</url>\n"
+        output += "</sources>\n</subreport_complete>"
+        return output
 
 
 class ResearchComplete(BaseModel):
@@ -118,7 +141,54 @@ class ResearchComplete(BaseModel):
     final_report: str = Field(description="The complete research report")
     
     def __str__(self) -> str:
-        return "✓ Research completed! Final report written."
+        output = "<research_complete>\n"
+        output += "<status>✓ Research completed! Final report written</status>\n"
+        output += f"<report length='{len(self.final_report)}'>\n{self.final_report}\n</report>\n"
+        output += "</research_complete>"
+        return output
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def scrape_page_content(url: str, timeout: int = 5) -> str:
+    """Scrape full text content from a webpage.
+    
+    Args:
+        url: URL to scrape
+        timeout: Request timeout in seconds
+        
+    Returns:
+        Scraped text content (up to 5,000 chars)
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        
+        # Parse HTML
+        soup = BeautifulSoup(response.content, 'lxml')
+        
+        # Remove script and style elements
+        for script in soup(["script", "style", "nav", "footer", "header"]):
+            script.decompose()
+        
+        # Get text
+        text = soup.get_text(separator=' ', strip=True)
+        
+        # Clean up whitespace
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        text = ' '.join(chunk for chunk in chunks if chunk)
+        
+        # Truncate to 5k chars for reasonable size
+        return text[:5000] if len(text) > 5000 else text
+        
+    except Exception as e:
+        return f"[Failed to scrape: {str(e)}]"
 
 
 # ============================================================================
@@ -127,7 +197,7 @@ class ResearchComplete(BaseModel):
 
 @tool_with_context
 def search(query: Annotated[str, "The search query to look up"], context: AgentContext) -> SearchResult:
-    """Search the web for information on a specific query. Returns sources with URLs, titles, and content."""
+    """Search the web for information on a specific query. Returns sources with URLs, titles, and full scraped content."""
     # Get API key from config
     serper_api_key = config.SERPER_API_KEY
     if not serper_api_key:
@@ -135,7 +205,7 @@ def search(query: Annotated[str, "The search query to look up"], context: AgentC
     
     # Search using Serper
     url = "https://google.serper.dev/search"
-    payload = {"q": query, "num": 5}
+    payload = {"q": query, "num": 3}
     headers = {
         "X-API-KEY": serper_api_key,
         "Content-Type": "application/json"
@@ -149,20 +219,40 @@ def search(query: Annotated[str, "The search query to look up"], context: AgentC
         return SearchResult(results=[{"error": f"Search failed: {str(e)}"}])
     
     # Get results
-    results = data.get("organic", [])[:5]
+    results = data.get("organic", [])[:3]
     
     if not results:
         return SearchResult(results=[])
     
-    # Format results
-    formatted_results = [
+    # Extract URLs and titles
+    search_results = [
         {
             "url": r.get("link", ""),
             "title": r.get("title", ""),
-            "content": r.get("snippet", "")
+            "snippet": r.get("snippet", "")
         }
         for r in results
     ]
+    
+    # Scrape full content from all URLs in parallel
+    formatted_results = []
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        # Submit all scraping tasks
+        future_to_result = {
+            executor.submit(scrape_page_content, r["url"]): r 
+            for r in search_results
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_result):
+            result = future_to_result[future]
+            scraped_content = future.result()
+            
+            formatted_results.append({
+                "url": result["url"],
+                "title": result["title"],
+                "content": scraped_content  # Full scraped content
+            })
     
     # Update context with new sources
     context.add_sources(formatted_results)
@@ -216,14 +306,14 @@ def write_subreport(
 
 
 @tool
-def finish(
+def write_final_report(
     final_report: Annotated[str, "The complete research report with citations"]
 ) -> ResearchComplete:
-    """Complete the research by writing a comprehensive final report that synthesizes all findings with proper citations."""
+    """Write the final research report that synthesizes all findings with proper citations. This completes the research."""
     return ResearchComplete(final_report=final_report)
 
 
 # Helper to get all tools as a list
 def get_all_tools():
     """Return all tools for the agent."""
-    return [search, ask_clarification, get_current_checklist, modify_checklist, write_subreport, finish]
+    return [search, ask_clarification, get_current_checklist, modify_checklist, write_subreport, write_final_report]

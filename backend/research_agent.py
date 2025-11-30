@@ -31,10 +31,11 @@ from typing import Literal
 from langgraph.graph import StateGraph, END
 from litellm import completion
 import config  # Load environment variables
-from models import AgentState, AgentContext, Message
+from models import AgentState, AgentContext, Message, LLMResponseMetadata
 from prompts import AGENT_SYSTEM_PROMPT
 from tools import get_all_tools
 from tool_handlers import execute_tool_with_context
+from chat_logger import get_chat_logger
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +136,13 @@ class DeepResearchAgent:
                 llm_params["temperature"] = 0.7
             
             response = completion(**llm_params)
-            logger.info("✅ LLM response received")
+            
+            # Log token usage
+            usage = response.usage if hasattr(response, 'usage') else None
+            if usage:
+                logger.info(f"✅ LLM response: {usage.prompt_tokens} in, {usage.completion_tokens} out")
+            else:
+                logger.info("✅ LLM response received")
         except Exception as e:
             logger.error(f"❌ Error in agent node: {e}")
             raise
@@ -165,6 +172,50 @@ class DeepResearchAgent:
                 for tc in response_message.tool_calls
             ]
             new_message["content"] = None  # No text content when calling tools
+        
+        # Log assistant message with metadata
+        chat_logger = get_chat_logger()
+        
+        # Extract metadata using Pydantic model
+        llm_metadata = LLMResponseMetadata.from_litellm_response(response)
+        
+        # Log info about captured data
+        if llm_metadata.tokens:
+            logger.info(f"✅ Token usage: {llm_metadata.tokens.prompt_tokens} in, {llm_metadata.tokens.completion_tokens} out")
+            if llm_metadata.tokens.reasoning_tokens:
+                logger.info(f"🧠 Reasoning tokens: {llm_metadata.tokens.reasoning_tokens}")
+        
+        if llm_metadata.reasoning_content:
+            logger.info(f"🧠 Reasoning captured: {len(llm_metadata.reasoning_content)} chars")
+        
+        # Debug logging
+        if logger.isEnabledFor(10):  # DEBUG level
+            logger.debug(f"Response structure: {dir(response)}")
+            logger.debug(f"Message structure: {dir(response_message)}")
+            if hasattr(response_message, '__dict__'):
+                logger.debug(f"Message dict keys: {response_message.__dict__.keys()}")
+        
+        # If we have reasoning tokens but no reasoning content, log a warning
+        if llm_metadata.tokens and llm_metadata.tokens.reasoning_tokens and llm_metadata.tokens.reasoning_tokens > 0:
+            if not llm_metadata.reasoning_content:
+                logger.warning(f"⚠️  Model used {llm_metadata.tokens.reasoning_tokens} reasoning tokens but no reasoning content was captured!")
+                logger.warning(f"   Response message attrs: {[attr for attr in dir(response_message) if not attr.startswith('_')]}")
+                # Try to get raw response data
+                if hasattr(response, 'model_dump') or hasattr(response, 'dict'):
+                    try:
+                        raw_data = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
+                        logger.warning(f"   Raw response keys: {list(raw_data.keys())}")
+                        if 'choices' in raw_data and len(raw_data['choices']) > 0:
+                            logger.warning(f"   Choice[0] keys: {list(raw_data['choices'][0].keys())}")
+                            if 'message' in raw_data['choices'][0]:
+                                logger.warning(f"   Message keys: {list(raw_data['choices'][0]['message'].keys())}")
+                    except Exception as e:
+                        logger.warning(f"   Could not dump raw response: {e}")
+        
+        # Log with metadata (convert to dict for JSON serialization)
+        metadata_dict = llm_metadata.to_dict()
+        message_with_metadata = {**new_message, "metadata": metadata_dict} if metadata_dict else new_message
+        chat_logger.log_message(message_with_metadata)
         
         return {"messages": [new_message]}
     
@@ -225,6 +276,10 @@ class DeepResearchAgent:
             # Save updated context back to state
             state_updates["context"] = context.to_dict()
             
+            # Log tool messages
+            chat_logger = get_chat_logger()
+            chat_logger.log_messages(tool_messages)
+            
             return {
                 "messages": tool_messages,
                 **state_updates
@@ -238,23 +293,27 @@ class DeepResearchAgent:
         """Decide if agent should continue or end."""
         last_message = state["messages"][-1]
         
-        # Check if agent called finish tool
-        try:
-            message_data = json.loads(last_message["content"])
-            tool_calls = message_data.get("tool_calls", [])
-            for tc in tool_calls:
-                if tc["function"]["name"] == "finish":
-                    return "end"
-        except:
-            pass
+        # If assistant wants to call tools, continue to tools node
+        if last_message.get("tool_calls"):
+            return "continue"
         
         # Check if final report exists
         if state.get("final_report"):
+            logger.info("✅ Final report exists - research complete")
             return "end"
         
         # Safety: max iterations
         if len(state["messages"]) > self.max_iterations * 2:
+            logger.warning("⚠️  Max iterations reached - forcing end")
             return "end"
+        
+        # Check if checklist is complete but agent hasn't finished
+        context = AgentContext.from_dict(state["context"])
+        total_items = len(context.checklist.items)
+        completed_items = sum(1 for item in context.checklist.items.values() if item.status == "completed")
+        
+        if total_items > 0 and completed_items == total_items and len(state["messages"]) > 10:
+            logger.warning(f"⚠️  All {total_items} items complete but no finish call - agent may be looping")
         
         return "continue"
     
@@ -267,6 +326,11 @@ class DeepResearchAgent:
         Returns:
             Dictionary with messages, context, and final_report
         """
+        # Start new chat session for logging
+        chat_logger = get_chat_logger()
+        session_id = chat_logger.start_session()
+        logger.info(f"📝 Chat session: {session_id}")
+        
         # Initialize with empty context
         context = AgentContext()
         
@@ -282,13 +346,36 @@ class DeepResearchAgent:
             }
             formatted_messages.append(msg)
         
+        # Log initial messages
+        chat_logger.log_messages(formatted_messages)
+        
         initial_state = {
             "messages": formatted_messages,
             "context": context.to_dict(),
             "final_report": None
         }
         
-        result = self.graph.invoke(initial_state)
+        result = self.graph.invoke(
+            initial_state,
+            config={"recursion_limit": 50}  # Allow more iterations for thorough research
+        )
+        
+        # Log final result
+        logger.info(f"🔍 Result keys: {list(result.keys())}")
+        logger.info(f"📊 final_report present: {bool(result.get('final_report'))}")
+        
+        if result.get("final_report"):
+            logger.info(f"✅ Final report length: {len(result['final_report'])} chars")
+            chat_logger.log_message({
+                "role": "system",
+                "content": f"Final report generated ({len(result['final_report'])} chars)",
+                "type": "completion"
+            })
+        else:
+            logger.warning("⚠️  No final_report in result!")
+        
+        logger.info(f"📝 Chat log: {chat_logger.get_session_file()}")
+        
         return result
 
 

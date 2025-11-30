@@ -22,6 +22,7 @@ backend/.env
 *.log
 backend.log
 frontend.log
+backend/chat_logs/
 
 # IDEs
 .vscode/

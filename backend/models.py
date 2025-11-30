@@ -180,4 +180,109 @@ class AgentContext(BaseModel):
         )
 
 
+class TokenUsage(BaseModel):
+    """Token usage statistics from LLM response."""
+    prompt_tokens: int = Field(default=0, description="Number of tokens in the prompt")
+    completion_tokens: int = Field(default=0, description="Number of tokens in the completion")
+    total_tokens: int = Field(default=0, description="Total tokens used")
+    reasoning_tokens: Optional[int] = Field(default=None, description="Number of tokens used for reasoning (o1, GPT-4o with reasoning)")
+    non_reasoning_tokens: Optional[int] = Field(default=None, description="Number of non-reasoning completion tokens")
+    
+    @classmethod
+    def from_litellm_usage(cls, usage: Any) -> "TokenUsage":
+        """Extract token usage from LiteLLM response usage object."""
+        if not usage:
+            return cls()
+        
+        token_data = {
+            "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+            "completion_tokens": getattr(usage, "completion_tokens", 0),
+            "total_tokens": getattr(usage, "total_tokens", 0)
+        }
+        
+        # Check for reasoning tokens (GPT-4o with reasoning, o1, etc.)
+        if hasattr(usage, 'completion_tokens_details'):
+            details = usage.completion_tokens_details
+            if hasattr(details, 'reasoning_tokens') and details.reasoning_tokens:
+                token_data["reasoning_tokens"] = details.reasoning_tokens
+                token_data["non_reasoning_tokens"] = token_data["completion_tokens"] - details.reasoning_tokens
+        
+        return cls(**token_data)
+
+
+class LLMResponseMetadata(BaseModel):
+    """Metadata from LLM response including tokens and reasoning content."""
+    tokens: Optional[TokenUsage] = Field(default=None, description="Token usage statistics")
+    reasoning_content: Optional[str] = Field(default=None, description="Extended thinking/reasoning content from models like o1")
+    model: Optional[str] = Field(default=None, description="Model that generated the response")
+    
+    @classmethod
+    def from_litellm_response(cls, response: Any) -> "LLMResponseMetadata":
+        """Extract metadata from LiteLLM response object.
+        
+        Attempts to extract:
+        - Token usage (including reasoning tokens)
+        - Reasoning content from various possible fields
+        - Model name
+        """
+        metadata = cls()
+        
+        # Extract token usage
+        if hasattr(response, 'usage') and response.usage:
+            metadata.tokens = TokenUsage.from_litellm_usage(response.usage)
+        
+        # Extract model name
+        if hasattr(response, 'model'):
+            metadata.model = response.model
+        
+        # Extract reasoning content - try multiple possible locations
+        reasoning_content = None
+        response_message = None
+        
+        if hasattr(response, 'choices') and len(response.choices) > 0:
+            choice = response.choices[0]
+            if hasattr(choice, 'message'):
+                response_message = choice.message
+                
+                # Try message-level fields
+                if hasattr(response_message, 'reasoning_content') and response_message.reasoning_content:
+                    reasoning_content = response_message.reasoning_content
+                elif hasattr(response_message, 'reasoning') and response_message.reasoning:
+                    reasoning_content = response_message.reasoning
+            
+            # Try choice-level fields
+            if not reasoning_content:
+                if hasattr(choice, 'reasoning_content') and choice.reasoning_content:
+                    reasoning_content = choice.reasoning_content
+                elif hasattr(choice, 'reasoning') and choice.reasoning:
+                    reasoning_content = choice.reasoning
+        
+        # Try response-level fields
+        if not reasoning_content:
+            if hasattr(response, 'reasoning_content') and response.reasoning_content:
+                reasoning_content = response.reasoning_content
+            elif hasattr(response, 'reasoning') and response.reasoning:
+                reasoning_content = response.reasoning
+        
+        if reasoning_content:
+            metadata.reasoning_content = reasoning_content
+        
+        return metadata
+    
+    def to_dict(self) -> dict:
+        """Convert to dict for logging, excluding None values."""
+        data = {}
+        
+        if self.tokens:
+            data["tokens"] = self.tokens.model_dump(exclude_none=True)
+        
+        if self.reasoning_content:
+            data["reasoning_content"] = self.reasoning_content
+        
+        if self.model:
+            data["model"] = self.model
+        
+        return data
+
+
 

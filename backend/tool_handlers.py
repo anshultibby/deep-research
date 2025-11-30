@@ -38,8 +38,9 @@ def execute_tool_with_context(tool_func, tool_name: str, arguments: dict, contex
         
         # Handle state updates
         state_updates = {}
-        if tool_name == "finish":
+        if tool_name == "write_final_report":
             state_updates["final_report"] = result.final_report
+            logger.info(f"  → 📊 Final report set: {len(result.final_report)} chars")
         
         logger.info(f"✓ {tool_name}")
         return str(result), state_updates

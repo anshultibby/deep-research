@@ -2,66 +2,23 @@
 
 Context Injection Pattern:
 --------------------------
-All tools accept a 'context: AgentContext' parameter that is:
-1. Injected at execution time by tool_handlers.py
-2. Excluded from the LLM schema (OpenAI doesn't see it)
-3. Available to any tool that needs it (tools can ignore it if not needed)
+All tools accept context via **kwargs:
+1. Tools define **kwargs parameter to accept arbitrary keyword arguments
+2. Context is extracted inside each tool using kwargs.get('context')
+3. tool_handlers.py calls tool.func() directly (not tool.invoke())
+4. Context is NOT in the LLM schema - the LLM only sees the actual parameters
 
-The @tool_with_context decorator automatically:
-- Creates proper schema WITHOUT the context parameter
-- Allows the tool function to accept context at runtime
+This simple approach ensures context is hidden from the LLM while being available to tools.
 """
 import os
 import requests
-import inspect
-from typing import List, Annotated, Callable, get_type_hints
+from typing import List, Annotated
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_core.tools import tool
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
 import config  # Load environment variables
 from models import AgentContext
-
-
-def tool_with_context(func: Callable) -> Callable:
-    """Decorator that wraps @tool to exclude 'context' parameter from schema.
-    
-    This ensures the LLM doesn't see or try to provide the context parameter,
-    while allowing us to inject it at execution time.
-    
-    Simplified approach:
-    1. Extract all parameters except 'context'
-    2. Build Pydantic schema from those parameters
-    3. Apply LangChain's @tool decorator
-    """
-    sig = inspect.signature(func)
-    type_hints = get_type_hints(func)
-    
-    # Build schema fields excluding 'context'
-    schema_fields = {}
-    for param_name, param in sig.parameters.items():
-        if param_name == 'context':
-            continue  # Skip context - will be injected at runtime
-        
-        annotation = type_hints.get(param_name, str)
-        
-        # Handle Annotated types (e.g., Annotated[str, "description"])
-        if hasattr(annotation, '__metadata__'):
-            base_type = annotation.__origin__
-            description = annotation.__metadata__[0] if annotation.__metadata__ else ""
-            schema_fields[param_name] = (base_type, Field(description=description))
-        else:
-            schema_fields[param_name] = (annotation, Field())
-    
-    # Create Pydantic model for args schema (without context parameter)
-    ArgsSchema = create_model(
-        f'{func.__name__}_schema',
-        **schema_fields,
-        __config__=None
-    )
-    
-    # Apply @tool decorator with the generated schema
-    return tool(args_schema=ArgsSchema)(func)
 
 
 # Tool return models with display methods
@@ -79,8 +36,9 @@ class SearchResult(BaseModel):
         output = f"<search_result>\n<summary>Found {len(self.results)} sources</summary>\n\n"
         for idx, r in enumerate(self.results, 1):
             content = r.get('content', 'No content')
-            # Show up to 5,000 chars of content for the agent to read
-            truncated_content = content[:5000] if len(content) > 5000 else content
+            # Truncate content based on config
+            max_tokens = config.SEARCH_CONTENT_MAX_TOKENS
+            truncated_content = content[:max_tokens] if len(content) > max_tokens else content
             
             output += f"<source id='{idx}'>\n"
             output += f"<title>{r.get('title', 'No title')}</title>\n"
@@ -175,7 +133,7 @@ def scrape_page_content(url: str, timeout: int = 5) -> str:
         timeout: Request timeout in seconds
         
     Returns:
-        Scraped text content (up to 5,000 chars)
+        Scraped text content (truncated to SEARCH_CONTENT_MAX_TOKENS)
     """
     try:
         headers = {
@@ -199,8 +157,9 @@ def scrape_page_content(url: str, timeout: int = 5) -> str:
         chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
         text = ' '.join(chunk for chunk in chunks if chunk)
         
-        # Truncate to 5k chars for reasonable size
-        return text[:5000] if len(text) > 5000 else text
+        # Truncate based on config
+        max_tokens = config.SEARCH_CONTENT_MAX_TOKENS
+        return text[:max_tokens] if len(text) > max_tokens else text
         
     except Exception as e:
         return f"[Failed to scrape: {str(e)}]"
@@ -210,9 +169,11 @@ def scrape_page_content(url: str, timeout: int = 5) -> str:
 # Tool Definitions
 # ============================================================================
 
-@tool_with_context
-def search(query: Annotated[str, "The search query to look up"], context: AgentContext) -> SearchResult:
+@tool
+def search(query: Annotated[str, "The search query to look up"], **kwargs) -> SearchResult:
     """Search the web for information on a specific query. Returns sources with URLs, titles, and full scraped content."""
+    context = kwargs.get('context')
+    
     # Get API key from config
     serper_api_key = config.SERPER_API_KEY
     if not serper_api_key:
@@ -220,7 +181,7 @@ def search(query: Annotated[str, "The search query to look up"], context: AgentC
     
     # Search using Serper
     url = "https://google.serper.dev/search"
-    payload = {"q": query, "num": 3}
+    payload = {"q": query, "num": config.SEARCH_NUM_RESULTS}
     headers = {
         "X-API-KEY": serper_api_key,
         "Content-Type": "application/json"
@@ -234,7 +195,7 @@ def search(query: Annotated[str, "The search query to look up"], context: AgentC
         return SearchResult(results=[{"error": f"Search failed: {str(e)}"}])
     
     # Get results
-    results = data.get("organic", [])[:3]
+    results = data.get("organic", [])[:config.SEARCH_NUM_RESULTS]
     
     if not results:
         return SearchResult(results=[])
@@ -251,7 +212,7 @@ def search(query: Annotated[str, "The search query to look up"], context: AgentC
     
     # Scrape full content from all URLs in parallel
     formatted_results = []
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=config.SEARCH_NUM_RESULTS) as executor:
         # Submit all scraping tasks
         future_to_result = {
             executor.submit(scrape_page_content, r["url"]): r 
@@ -275,18 +236,20 @@ def search(query: Annotated[str, "The search query to look up"], context: AgentC
     return SearchResult(results=formatted_results)
 
 
-@tool_with_context
+@tool
 def ask_clarification(
     questions: Annotated[List[str], "List of 2-3 clarifying questions to ask the user"],
-    context: AgentContext
+    **kwargs
 ) -> ClarificationRequest:
     """Ask the user clarifying questions. Use ONLY at the beginning if the query is too vague. Pauses execution for user input."""
     return ClarificationRequest(questions=questions)
 
 
-@tool_with_context
-def get_current_checklist(context: AgentContext) -> ChecklistView:
+@tool
+def get_current_checklist(**kwargs) -> ChecklistView:
     """Get the current state of your research checklist and progress. Shows what items are pending/completed and sources count."""
+    context = kwargs.get('context')
+    
     return ChecklistView(
         checklist_display=context.checklist.format_display(),
         total_items=len(context.checklist.items),
@@ -295,25 +258,29 @@ def get_current_checklist(context: AgentContext) -> ChecklistView:
     )
 
 
-@tool_with_context
+@tool
 def modify_checklist(
     items: Annotated[List[str], "List of research questions/topics to investigate"],
-    context: AgentContext
+    **kwargs
 ) -> ChecklistUpdate:
     """Add or update research checklist items. Use to plan what needs to be researched."""
+    context = kwargs.get('context')
+    
     # Update context with new items
     context.checklist.add_items(items)
     return ChecklistUpdate(items=items)
 
 
-@tool_with_context
+@tool
 def write_subreport(
     item_id: Annotated[str, "The checklist item ID (e.g., 'item_1')"],
     findings: Annotated[str, "Your research findings (2-3 paragraphs)"],
     source_urls: Annotated[List[str], "URLs of sources used for these findings"],
-    context: AgentContext
+    **kwargs
 ) -> SubreportComplete:
     """Write findings for a specific checklist item. Include the item_id, your findings, and source URLs used."""
+    context = kwargs.get('context')
+    
     # Find source IDs and complete the checklist item
     source_ids = context.find_source_ids_by_urls(source_urls)
     context.checklist.complete_item(item_id, findings, source_ids)
@@ -321,10 +288,10 @@ def write_subreport(
     return SubreportComplete(item_id=item_id, findings=findings, source_urls=source_urls)
 
 
-@tool_with_context
+@tool
 def write_final_report(
     final_report: Annotated[str, "The complete research report with citations"],
-    context: AgentContext
+    **kwargs
 ) -> ResearchComplete:
     """Write the final research report that synthesizes all findings with proper citations. This completes the research."""
     return ResearchComplete(final_report=final_report)

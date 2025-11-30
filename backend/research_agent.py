@@ -308,13 +308,13 @@ class DeepResearchAgent:
         self, 
         messages: List[Dict[str, Any]]
     ) -> Generator[str, None, None]:
-        """Run the research agent with streaming events via SSE.
+        """Run the research agent with real-time SSE streaming.
         
         Args:
             messages: List of messages in format [{"role": "user", "content": "..."}]
         
         Yields:
-            SSE-formatted event strings
+            SSE-formatted event strings in real-time as events occur
         """
         # Start new chat session for logging
         chat_logger = get_chat_logger()
@@ -340,37 +340,99 @@ class DeepResearchAgent:
             StateKeys.FINAL_REPORT: None
         }
         
-        # Event queue for streaming
-        events_to_send: List[StreamEvent] = []
-        
-        def event_callback(event: StreamEvent):
-            """Callback to collect events during graph execution."""
-            events_to_send.append(event)
-        
-        # Set callback for this streaming session
-        self._event_callback = event_callback
+        # Track state for incremental updates
+        last_sources_count = 0
         
         try:
-            # Run the agent graph (using invoke, but with event callback)
-            # Note: LangGraph's stream() doesn't work well with our tool pattern,
-            # so we use invoke with callbacks instead
-            result = self.graph.invoke(
+            # Use LangGraph's built-in streaming
+            for event in self.graph.stream(
                 initial_state,
-                config={"recursion_limit": 50}
-            )
+                config={"recursion_limit": 50},
+                stream_mode="updates"
+            ):
+                logger.info(f"📡 Graph event: {list(event.keys())}")
+                
+                # Process each node's output
+                for node_name, node_output in event.items():
+                    
+                    # AGENT NODE: Detect tool calls being initiated
+                    if node_name == "agent":
+                        messages = node_output.get(StateKeys.MESSAGES, [])
+                        for msg in messages:
+                            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                                # Emit tool_call_started events
+                                for tool_call in msg["tool_calls"]:
+                                    event_obj = StreamEvent(
+                                        event_type="tool_call_started",
+                                        data={
+                                            "tool_name": tool_call["function"]["name"],
+                                            "tool_call_id": tool_call["id"],
+                                            "arguments": tool_call["function"]["arguments"]
+                                        }
+                                    )
+                                    yield event_obj.to_sse()
+                    
+                    # TOOL NODE: Detect tool completions and context updates
+                    elif node_name == "tools":
+                        # Tool completion events
+                        messages = node_output.get(StateKeys.MESSAGES, [])
+                        for msg in messages:
+                            if msg.get("role") == "tool":
+                                event_obj = StreamEvent(
+                                    event_type="tool_call_completed",
+                                    data={
+                                        "tool_name": msg.get("name"),
+                                        "tool_call_id": msg.get("tool_call_id"),
+                                        "success": True
+                                    }
+                                )
+                                yield event_obj.to_sse()
+                        
+                        # Checklist updates
+                        if StateKeys.CONTEXT in node_output:
+                            context_dict = node_output[StateKeys.CONTEXT]
+                            checklist_items = context_dict.get("checklist", {}).get("items", {})
+                            if checklist_items:
+                                event_obj = StreamEvent(
+                                    event_type="checklist_updated",
+                                    data={"items": checklist_items}
+                                )
+                                yield event_obj.to_sse()
+                            
+                            # Source discoveries (only send new sources)
+                            sources = context_dict.get("sources", [])
+                            if len(sources) > last_sources_count:
+                                new_sources = sources[last_sources_count:]
+                                event_obj = StreamEvent(
+                                    event_type="source_discovered",
+                                    data={"sources": new_sources}
+                                )
+                                yield event_obj.to_sse()
+                                last_sources_count = len(sources)
+                        
+                        # Final report
+                        if StateKeys.FINAL_REPORT in node_output and node_output[StateKeys.FINAL_REPORT]:
+                            event_obj = StreamEvent(
+                                event_type="final_report",
+                                data={"report": node_output[StateKeys.FINAL_REPORT]}
+                            )
+                            yield event_obj.to_sse()
             
-            # Send all collected events
-            for event in events_to_send:
-                yield event.to_sse()
+            # Get final state after streaming completes
+            final_state = {
+                StateKeys.MESSAGES: formatted_messages,
+                StateKeys.CONTEXT: context.to_dict(),
+                StateKeys.FINAL_REPORT: None
+            }
+            
+            # Try to get the actual final state from the last event
+            # (LangGraph stream doesn't give us easy access to final state)
+            # So we'll reconstruct it from the events
             
             # Send completion event
             completion_event = StreamEvent(
                 event_type="complete",
-                data={
-                    "message": "Research complete",
-                    "context": result.get(StateKeys.CONTEXT),
-                    "messages": result.get(StateKeys.MESSAGES)
-                }
+                data={"message": "Research complete"}
             )
             yield completion_event.to_sse()
             
@@ -387,10 +449,6 @@ class DeepResearchAgent:
                 data={"error": str(e)}
             )
             yield error_event.to_sse()
-        
-        finally:
-            # Clear callback
-            self._event_callback = None
 
 
 def main():

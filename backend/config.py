@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     
     # Model Configuration
     default_model: str = Field(
-        default="gpt-5",
+        default="gpt-5.1",
         description="Default LLM model to use (gpt-5 has fixed temperature=1)"
     )
     max_iterations: int = Field(
@@ -36,6 +36,20 @@ class Settings(BaseSettings):
         ge=1,
         le=100,
         description="Maximum number of agent iterations"
+    )
+    
+    # Search Configuration
+    search_num_results: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Number of search results to fetch per search query"
+    )
+    search_content_max_tokens: int = Field(
+        default=5000,
+        ge=500,
+        le=20000,
+        description="Maximum number of characters to extract from each web page before truncating"
     )
     
     @field_validator('openai_api_key', 'serper_api_key')
@@ -59,4 +73,6 @@ OPENAI_API_KEY = settings.openai_api_key
 SERPER_API_KEY = settings.serper_api_key
 DEFAULT_MODEL = settings.default_model
 MAX_ITERATIONS = settings.max_iterations
+SEARCH_NUM_RESULTS = settings.search_num_results
+SEARCH_CONTENT_MAX_TOKENS = settings.search_content_max_tokens
 

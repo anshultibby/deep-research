@@ -23,8 +23,8 @@ def execute_tool_with_context(
 ) -> Tuple[str, Dict[str, Any]]:
     """Execute a single tool with context always injected.
     
-    All tools accept a 'context' parameter. It's injected here regardless of
-    whether the tool uses it or not.
+    All tools accept context via **kwargs. We call tool.func() directly (not invoke())
+    to pass context without it being validated against the schema.
     
     Args:
         tool_func: The tool function
@@ -38,11 +38,11 @@ def execute_tool_with_context(
     try:
         logger.info(f"🔧 {tool_name}")
         
-        # Always inject context into arguments
+        # Inject context into arguments for tools to access via kwargs
         arguments['context'] = context
         
-        # Execute tool
-        result = tool_func.invoke(arguments)
+        # Execute tool directly via .func() to bypass schema validation
+        result = tool_func.func(**arguments)
         
         # Handle state updates
         state_updates: Dict[str, Any] = {}

@@ -5,10 +5,39 @@ from pydantic import BaseModel, Field
 
 
 # ============================================================================
+# Constants
+# ============================================================================
+
+class StateKeys:
+    """Constants for state dictionary keys to avoid magic strings."""
+    MESSAGES = "messages"
+    CONTEXT = "context"
+    FINAL_REPORT = "final_report"
+
+
+class MessageRoles:
+    """Constants for message roles."""
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+    TOOL = "tool"
+
+
+class ToolNames:
+    """Constants for tool names."""
+    SEARCH = "search"
+    ASK_CLARIFICATION = "ask_clarification"
+    GET_CURRENT_CHECKLIST = "get_current_checklist"
+    MODIFY_CHECKLIST = "modify_checklist"
+    WRITE_SUBREPORT = "write_subreport"
+    WRITE_FINAL_REPORT = "write_final_report"
+
+
+# ============================================================================
 # TypedDict definitions for LangGraph state
 # ============================================================================
 
-class Message(TypedDict, total=False):
+class Message(BaseModel):
     """Standard message format compatible with OpenAI Chat API.
     
     Message history is stored in OpenAI-compatible format for simplicity:
@@ -18,29 +47,106 @@ class Message(TypedDict, total=False):
     - Tool results: role="tool", content="...", tool_call_id="..."
     """
     role: Literal["user", "assistant", "system", "tool"]
-    content: Optional[str]  # Can be None for assistant messages with tool_calls
-    name: Optional[str]  # Tool name for tool messages
-    tool_calls: Optional[List[Dict[str, Any]]]  # For assistant messages calling tools
-    tool_call_id: Optional[str]  # For tool result messages
+    content: Optional[str] = None  # Can be None for assistant messages with tool_calls
+    name: Optional[str] = None  # Tool name for tool messages
+    tool_calls: Optional[List[Dict[str, Any]]] = None  # For assistant messages calling tools
+    tool_call_id: Optional[str] = None  # For tool result messages
+
+    @classmethod
+    def user(cls, content: str) -> "Message":
+        """Create a user message."""
+        return cls(role=MessageRoles.USER, content=content)
+    
+    @classmethod
+    def assistant(cls, content: str) -> "Message":
+        """Create an assistant text message."""
+        return cls(role=MessageRoles.ASSISTANT, content=content)
+    
+    @classmethod
+    def assistant_with_tools(cls, tool_calls: List[Dict[str, Any]]) -> "Message":
+        """Create an assistant message with tool calls."""
+        return cls(
+            role=MessageRoles.ASSISTANT,
+            content=None,  # No text content when calling tools
+            tool_calls=tool_calls
+        )
+    
+    @classmethod
+    def tool(cls, content: str, tool_name: str, tool_call_id: str) -> "Message":
+        """Create a tool result message."""
+        return cls(
+            role=MessageRoles.TOOL,
+            content=content,
+            name=tool_name,
+            tool_call_id=tool_call_id
+        )
+    
+    @classmethod
+    def system(cls, content: str) -> "Message":
+        """Create a system message."""
+        return cls(role=MessageRoles.SYSTEM, content=content)
+    
+    @classmethod
+    def from_litellm_message(cls, litellm_msg: Any) -> "Message":
+        """Convert a LiteLLM response message to our Message format.
+        
+        Args:
+            litellm_msg: The message object from LiteLLM response.choices[0].message
+            
+        Returns:
+            Message instance
+        """
+        # Check if message has tool calls
+        if hasattr(litellm_msg, 'tool_calls') and litellm_msg.tool_calls:
+            tool_calls = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
+                    }
+                }
+                for tc in litellm_msg.tool_calls
+            ]
+            return cls.assistant_with_tools(tool_calls)
+        else:
+            # Regular assistant message with text content
+            content = litellm_msg.content or ""
+            return cls.assistant(content)
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Message":
+        """Create Message from dictionary (for deserialization from state)."""
+        return cls(**data)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary, excluding None values for API compatibility."""
+        return self.model_dump(exclude_none=True)
+    
+    def to_dict_with_none(self) -> Dict[str, Any]:
+        """Convert to dictionary, including None values (for state storage)."""
+        return self.model_dump()
 
 
-# Type alias for context dict structure
+# Type aliases for state structure
 ContextDict: TypeAlias = Dict[str, Any]  # Serialized AgentContext
+MessageDict: TypeAlias = Dict[str, Any]  # Serialized Message
 
 
 class AgentState(TypedDict):
     """LangGraph state for the agentic research agent.
     
     Message History:
-    - Stored in OpenAI-compatible format for simplicity
-    - Tool calls are preserved in their original structure
-    - Easy to pass directly to LLM APIs
+    - Stored as dicts in OpenAI-compatible format for LangGraph serialization
+    - Use Message.from_dict() to load as Pydantic models
+    - Use Message.to_dict() to convert back for state storage
     
     Context:
     - Stored as dict for LangGraph compatibility
     - Use AgentContext.from_dict() to load as Pydantic model
     """
-    messages: Annotated[list[Message], operator.add]  # Message history
+    messages: Annotated[List[MessageDict], operator.add]  # Message history (as dicts)
     context: ContextDict  # Agent context (serialized AgentContext)
     final_report: Optional[str]  # Final synthesized report
 
@@ -283,6 +389,111 @@ class LLMResponseMetadata(BaseModel):
             data["model"] = self.model
         
         return data
+
+
+# ============================================================================
+# SSE Event Models for Streaming
+# ============================================================================
+
+class EventTypes:
+    """Constants for SSE event types."""
+    TOOL_CALL_STARTED = "tool_call_started"
+    TOOL_CALL_COMPLETED = "tool_call_completed"
+    CHECKLIST_UPDATED = "checklist_updated"
+    SOURCE_DISCOVERED = "source_discovered"
+    FINAL_REPORT = "final_report"
+    ERROR = "error"
+    COMPLETE = "complete"
+
+
+class StreamEvent(BaseModel):
+    """Base model for streaming events."""
+    event_type: str = Field(description="Type of event")
+    data: Dict[str, Any] = Field(description="Event payload")
+    
+    def to_sse(self) -> str:
+        """Convert to SSE format: event: type\ndata: json\n\n"""
+        import json
+        return f"event: {self.event_type}\ndata: {json.dumps(self.data)}\n\n"
+
+
+class ToolCallStartedEvent(BaseModel):
+    """Event emitted when a tool call starts."""
+    tool_name: str
+    tool_call_id: str
+    arguments: Dict[str, Any]
+    
+    def to_stream_event(self) -> StreamEvent:
+        return StreamEvent(
+            event_type=EventTypes.TOOL_CALL_STARTED,
+            data={
+                "tool_name": self.tool_name,
+                "tool_call_id": self.tool_call_id,
+                "arguments": self.arguments
+            }
+        )
+
+
+class ToolCallCompletedEvent(BaseModel):
+    """Event emitted when a tool call completes."""
+    tool_name: str
+    tool_call_id: str
+    success: bool
+    result_preview: Optional[str] = None  # Short preview of result
+    
+    def to_stream_event(self) -> StreamEvent:
+        return StreamEvent(
+            event_type=EventTypes.TOOL_CALL_COMPLETED,
+            data={
+                "tool_name": self.tool_name,
+                "tool_call_id": self.tool_call_id,
+                "success": self.success,
+                "result_preview": self.result_preview
+            }
+        )
+
+
+class ChecklistUpdatedEvent(BaseModel):
+    """Event emitted when checklist is modified."""
+    items: Dict[str, Dict[str, Any]]  # Full checklist state
+    action: str  # "added", "completed", "updated"
+    affected_item_ids: List[str]
+    
+    def to_stream_event(self) -> StreamEvent:
+        return StreamEvent(
+            event_type=EventTypes.CHECKLIST_UPDATED,
+            data={
+                "items": self.items,
+                "action": self.action,
+                "affected_item_ids": self.affected_item_ids
+            }
+        )
+
+
+class SourceDiscoveredEvent(BaseModel):
+    """Event emitted when new sources are found."""
+    sources: List[Dict[str, Any]]  # List of Source dicts
+    
+    def to_stream_event(self) -> StreamEvent:
+        return StreamEvent(
+            event_type=EventTypes.SOURCE_DISCOVERED,
+            data={
+                "sources": self.sources
+            }
+        )
+
+
+class FinalReportEvent(BaseModel):
+    """Event emitted when final report is generated."""
+    report: str
+    
+    def to_stream_event(self) -> StreamEvent:
+        return StreamEvent(
+            event_type=EventTypes.FINAL_REPORT,
+            data={
+                "report": self.report
+            }
+        )
 
 
 

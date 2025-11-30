@@ -24,17 +24,25 @@ This format:
 - Makes debugging easy (you can see exactly what's sent to LLM)
 - Works with any LLM provider through LiteLLM
 """
-import os
-import json
 import logging
-from typing import Literal
+from typing import Literal, Dict, List, Any, Generator, Optional
 from langgraph.graph import StateGraph, END
-from litellm import completion
-import config  # Load environment variables
-from models import AgentState, AgentContext, Message, LLMResponseMetadata
+from litellm import completion, AuthenticationError, RateLimitError, APIError
+import config
+from models import (
+    AgentState, 
+    AgentContext, 
+    Message, 
+    LLMResponseMetadata,
+    StateKeys,
+    MessageRoles,
+    ToolNames,
+    StreamEvent,
+    FinalReportEvent
+)
 from prompts import AGENT_SYSTEM_PROMPT
 from tools import get_all_tools
-from tool_handlers import execute_tool_with_context
+from tool_handlers import execute_tool_calls
 from chat_logger import get_chat_logger
 
 logger = logging.getLogger(__name__)
@@ -58,6 +66,9 @@ class DeepResearchAgent:
         self.tool_schemas = self._convert_tools_to_schemas()
         
         self.graph = self._build_graph()
+        
+        # Event callback for streaming (set during streaming mode)
+        self._event_callback: Optional[callable] = None
     
     def _convert_tools_to_schemas(self) -> list:
         """Convert LangChain tools to LiteLLM tool schemas."""
@@ -101,189 +112,99 @@ class DeepResearchAgent:
         
         return workflow.compile()
     
-    def _agent_node(self, state: AgentState) -> dict:
+    def _agent_node(self, state: AgentState) -> Dict[str, List[Dict[str, Any]]]:
         """Agent node that decides what to do next."""
+        message_dicts = state[StateKeys.MESSAGES]
+        logger.info(f"🧠 Agent thinking... ({len(message_dicts)} messages)")
+        
         try:
-            messages = state["messages"]
-            logger.info(f"🧠 Agent thinking... ({len(messages)} messages)")
+            # Prepare system message
+            system_message = Message.system(AGENT_SYSTEM_PROMPT)
             
-            # Build system prompt (no dynamic content - agent uses get_current_checklist tool)
-            system_message = {
-                "role": "system",
-                "content": AGENT_SYSTEM_PROMPT
-            }
-            
-            # Messages are already in OpenAI-compatible format - just pass them through
-            # Filter out None values from messages for clean API calls
-            clean_messages = []
-            for msg in messages:
-                clean_msg = {k: v for k, v in msg.items() if v is not None}
-                clean_messages.append(clean_msg)
+            # Remove None values from messages (API compatibility)
+            clean_messages = [
+                {k: v for k, v in msg.items() if v is not None}
+                for msg in message_dicts
+            ]
             
             # Call LLM with tools
             logger.info(f"🤖 Calling {self.model} with {len(self.tool_schemas)} tools...")
             
-            # GPT-5 only supports temperature=1, other models support configurable temperature
             llm_params = {
                 "model": self.model,
-                "messages": [system_message] + clean_messages,
+                "messages": [system_message.to_dict()] + clean_messages,
                 "tools": self.tool_schemas,
                 "tool_choice": "auto"
             }
             
-            # Only add temperature for non-GPT-5 models
-            if not self.model.startswith("gpt-5"):
-                llm_params["temperature"] = 0.7
-            
             response = completion(**llm_params)
-            
-            # Log token usage
-            usage = response.usage if hasattr(response, 'usage') else None
-            if usage:
-                logger.info(f"✅ LLM response: {usage.prompt_tokens} in, {usage.completion_tokens} out")
-            else:
-                logger.info("✅ LLM response received")
+
+        except AuthenticationError as e:
+            logger.error(f"❌ Authentication error: {e}")
+            raise ValueError(f"Invalid API key for model {self.model}") from e
+        except RateLimitError as e:
+            logger.error(f"❌ Rate limit error: {e}")
+            raise ValueError(f"Rate limit exceeded for model {self.model}") from e
+        except APIError as e:
+            logger.error(f"❌ API error: {e}")
+            raise
         except Exception as e:
-            logger.error(f"❌ Error in agent node: {e}")
+            logger.error(f"❌ Unexpected error in agent node: {e}")
             raise
         
-        response_message = response.choices[0].message
-        
-        # Store message in OpenAI-compatible format
-        new_message: Message = {
-            "role": "assistant",
-            "content": response_message.content,
-            "name": None,
-            "tool_calls": None,
-            "tool_call_id": None
-        }
-        
-        # If LLM wants to call tools, store tool_calls
-        if hasattr(response_message, 'tool_calls') and response_message.tool_calls:
-            new_message["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments
-                    }
-                }
-                for tc in response_message.tool_calls
-            ]
-            new_message["content"] = None  # No text content when calling tools
+        # Convert LiteLLM response to our Message format
+        litellm_message = response.choices[0].message
+        new_message = Message.from_litellm_message(litellm_message)
         
         # Log assistant message with metadata
         chat_logger = get_chat_logger()
-        
-        # Extract metadata using Pydantic model
         llm_metadata = LLMResponseMetadata.from_litellm_response(response)
-        
-        # Log info about captured data
-        if llm_metadata.tokens:
-            logger.info(f"✅ Token usage: {llm_metadata.tokens.prompt_tokens} in, {llm_metadata.tokens.completion_tokens} out")
-            if llm_metadata.tokens.reasoning_tokens:
-                logger.info(f"🧠 Reasoning tokens: {llm_metadata.tokens.reasoning_tokens}")
-        
-        if llm_metadata.reasoning_content:
-            logger.info(f"🧠 Reasoning captured: {len(llm_metadata.reasoning_content)} chars")
-        
-        # Debug logging
-        if logger.isEnabledFor(10):  # DEBUG level
-            logger.debug(f"Response structure: {dir(response)}")
-            logger.debug(f"Message structure: {dir(response_message)}")
-            if hasattr(response_message, '__dict__'):
-                logger.debug(f"Message dict keys: {response_message.__dict__.keys()}")
-        
-        # If we have reasoning tokens but no reasoning content, log a warning
-        if llm_metadata.tokens and llm_metadata.tokens.reasoning_tokens and llm_metadata.tokens.reasoning_tokens > 0:
-            if not llm_metadata.reasoning_content:
-                logger.warning(f"⚠️  Model used {llm_metadata.tokens.reasoning_tokens} reasoning tokens but no reasoning content was captured!")
-                logger.warning(f"   Response message attrs: {[attr for attr in dir(response_message) if not attr.startswith('_')]}")
-                # Try to get raw response data
-                if hasattr(response, 'model_dump') or hasattr(response, 'dict'):
-                    try:
-                        raw_data = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
-                        logger.warning(f"   Raw response keys: {list(raw_data.keys())}")
-                        if 'choices' in raw_data and len(raw_data['choices']) > 0:
-                            logger.warning(f"   Choice[0] keys: {list(raw_data['choices'][0].keys())}")
-                            if 'message' in raw_data['choices'][0]:
-                                logger.warning(f"   Message keys: {list(raw_data['choices'][0]['message'].keys())}")
-                    except Exception as e:
-                        logger.warning(f"   Could not dump raw response: {e}")
-        
-        # Log with metadata (convert to dict for JSON serialization)
         metadata_dict = llm_metadata.to_dict()
-        message_with_metadata = {**new_message, "metadata": metadata_dict} if metadata_dict else new_message
+        
+        # Add metadata to message for logging
+        message_with_metadata = {**new_message.to_dict_with_none(), "metadata": metadata_dict} if metadata_dict else new_message.to_dict_with_none()
         chat_logger.log_message(message_with_metadata)
         
-        return {"messages": [new_message]}
+        # Return message as dict for state storage
+        return {StateKeys.MESSAGES: [new_message.to_dict_with_none()]}
     
-    def _tool_node(self, state: AgentState) -> dict:
+    def _tool_node(self, state: AgentState) -> Dict[str, Any]:
         """Execute tools based on agent's decision."""
-        try:
-            last_message = state["messages"][-1]
-            
-            # Get tool calls from last assistant message
-            tool_calls = last_message.get("tool_calls", [])
-            if not tool_calls:
-                logger.warning("⚠️  No tool calls found in message")
-                return {"messages": []}
-            
-            logger.info(f"🔧 Executing {len(tool_calls)} tool(s)...")
-            
-            # Load context (shared across all tool calls)
-            context = AgentContext.from_dict(state["context"])
-            
-            tool_messages = []
-            state_updates = {}
-            
-            for tool_call in tool_calls:
-                function_name = tool_call["function"]["name"]
-                arguments = json.loads(tool_call["function"]["arguments"])
-                
-                # Find the tool
-                tool_func = next((t for t in self.tools if t.name == function_name), None)
-                if not tool_func:
-                    tool_messages.append({
-                        "role": "tool",
-                        "content": f"Unknown tool: {function_name}",
-                        "name": function_name,
-                        "tool_call_id": tool_call["id"],
-                        "tool_calls": None
-                    })
-                    continue
-                
-                # Execute tool with context
-                logger.info(f"  → Executing {function_name} with args: {list(arguments.keys())}")
-                display_message, additional_updates = execute_tool_with_context(
-                    tool_func, function_name, arguments, context
-                )
-                logger.info(f"  ✓ {function_name} completed")
-                
-                # Add tool result message in OpenAI format
-                tool_messages.append({
-                    "role": "tool",
-                    "content": display_message,
-                    "name": function_name,
-                    "tool_call_id": tool_call["id"],  # Required by OpenAI
-                    "tool_calls": None  # Not applicable for tool messages
-                })
-                
-                # Collect state updates (like final_report)
-                state_updates.update(additional_updates)
+        last_message = state[StateKeys.MESSAGES][-1]
         
-            # Save updated context back to state
-            state_updates["context"] = context.to_dict()
+        # Get tool calls from last assistant message
+        tool_calls = last_message.get("tool_calls", [])
+        if not tool_calls:
+            logger.warning("⚠️  No tool calls found in message")
+            return {StateKeys.MESSAGES: []}
+        
+        try:
+            # Load context (shared across all tool calls)
+            context = AgentContext.from_dict(state[StateKeys.CONTEXT])
+            
+            # Execute all tool calls (with optional event streaming)
+            tool_messages, state_updates = execute_tool_calls(
+                tool_calls=tool_calls,
+                available_tools=self.tools,
+                context=context,
+                event_callback=self._event_callback  # Pass callback for streaming
+            )
             
             # Log tool messages
             chat_logger = get_chat_logger()
             chat_logger.log_messages(tool_messages)
             
+            # Emit final report event if it was generated
+            if StateKeys.FINAL_REPORT in state_updates and state_updates[StateKeys.FINAL_REPORT]:
+                if self._event_callback:
+                    report_event = FinalReportEvent(report=state_updates[StateKeys.FINAL_REPORT])
+                    self._event_callback(report_event.to_stream_event())
+            
             return {
-                "messages": tool_messages,
+                StateKeys.MESSAGES: tool_messages,
                 **state_updates
             }
+            
         except Exception as e:
             logger.error(f"❌ Error in tool node: {e}")
             raise
@@ -291,40 +212,47 @@ class DeepResearchAgent:
     
     def _should_continue(self, state: AgentState) -> Literal["continue", "end"]:
         """Decide if agent should continue or end."""
-        last_message = state["messages"][-1]
+        last_message = state[StateKeys.MESSAGES][-1]
         
         # If assistant wants to call tools, continue to tools node
         if last_message.get("tool_calls"):
             return "continue"
         
         # Check if final report exists
-        if state.get("final_report"):
+        if state.get(StateKeys.FINAL_REPORT):
             logger.info("✅ Final report exists - research complete")
             return "end"
         
         # Safety: max iterations
-        if len(state["messages"]) > self.max_iterations * 2:
-            logger.warning("⚠️  Max iterations reached - forcing end")
+        message_count = len(state[StateKeys.MESSAGES])
+        if message_count > self.max_iterations * 2:
+            logger.warning(f"⚠️  Max iterations reached ({message_count} messages) - forcing end")
             return "end"
         
         # Check if checklist is complete but agent hasn't finished
-        context = AgentContext.from_dict(state["context"])
+        context = AgentContext.from_dict(state[StateKeys.CONTEXT])
         total_items = len(context.checklist.items)
-        completed_items = sum(1 for item in context.checklist.items.values() if item.status == "completed")
+        completed_items = sum(
+            1 for item in context.checklist.items.values() 
+            if item.status == "completed"
+        )
         
-        if total_items > 0 and completed_items == total_items and len(state["messages"]) > 10:
-            logger.warning(f"⚠️  All {total_items} items complete but no finish call - agent may be looping")
+        if total_items > 0 and completed_items == total_items and message_count > 10:
+            logger.warning(
+                f"⚠️  All {total_items} items complete but no finish call - "
+                f"agent may be looping"
+            )
         
         return "continue"
     
-    def research(self, messages: list[dict]) -> dict:
+    def research(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Run the research agent.
         
         Args:
             messages: List of messages in format [{"role": "user", "content": "..."}]
         
         Returns:
-            Dictionary with messages, context, and final_report
+            Dictionary with messages, context, and final_report (AgentState)
         """
         # Start new chat session for logging
         chat_logger = get_chat_logger()
@@ -334,27 +262,23 @@ class DeepResearchAgent:
         # Initialize with empty context
         context = AgentContext()
         
-        # Format messages in OpenAI-compatible format
-        formatted_messages = []
+        # Convert incoming messages to Message objects, then to dicts for state
+        formatted_messages: List[Dict[str, Any]] = []
         for m in messages:
-            msg = {
-                "role": m["role"],
-                "content": m.get("content"),
-                "name": m.get("name"),
-                "tool_calls": m.get("tool_calls"),
-                "tool_call_id": m.get("tool_call_id")
-            }
-            formatted_messages.append(msg)
+            msg = Message.from_dict(m)
+            formatted_messages.append(msg.to_dict_with_none())
         
         # Log initial messages
         chat_logger.log_messages(formatted_messages)
         
-        initial_state = {
-            "messages": formatted_messages,
-            "context": context.to_dict(),
-            "final_report": None
+        # Create initial state
+        initial_state: AgentState = {
+            StateKeys.MESSAGES: formatted_messages,
+            StateKeys.CONTEXT: context.to_dict(),
+            StateKeys.FINAL_REPORT: None
         }
         
+        # Run the agent graph
         result = self.graph.invoke(
             initial_state,
             config={"recursion_limit": 50}  # Allow more iterations for thorough research
@@ -362,21 +286,111 @@ class DeepResearchAgent:
         
         # Log final result
         logger.info(f"🔍 Result keys: {list(result.keys())}")
-        logger.info(f"📊 final_report present: {bool(result.get('final_report'))}")
+        final_report = result.get(StateKeys.FINAL_REPORT)
+        logger.info(f"📊 final_report present: {bool(final_report)}")
         
-        if result.get("final_report"):
-            logger.info(f"✅ Final report length: {len(result['final_report'])} chars")
-            chat_logger.log_message({
-                "role": "system",
-                "content": f"Final report generated ({len(result['final_report'])} chars)",
-                "type": "completion"
-            })
+        if final_report:
+            logger.info(f"✅ Final report length: {len(final_report)} chars")
+            completion_msg = Message.system(
+                f"Final report generated ({len(final_report)} chars)"
+            )
+            completion_dict = completion_msg.to_dict_with_none()
+            completion_dict["type"] = "completion"
+            chat_logger.log_message(completion_dict)
         else:
             logger.warning("⚠️  No final_report in result!")
         
         logger.info(f"📝 Chat log: {chat_logger.get_session_file()}")
         
         return result
+    
+    def research_stream(
+        self, 
+        messages: List[Dict[str, Any]]
+    ) -> Generator[str, None, None]:
+        """Run the research agent with streaming events via SSE.
+        
+        Args:
+            messages: List of messages in format [{"role": "user", "content": "..."}]
+        
+        Yields:
+            SSE-formatted event strings
+        """
+        # Start new chat session for logging
+        chat_logger = get_chat_logger()
+        session_id = chat_logger.start_session()
+        logger.info(f"📝 Chat session (streaming): {session_id}")
+        
+        # Initialize with empty context
+        context = AgentContext()
+        
+        # Convert incoming messages to Message objects
+        formatted_messages: List[Dict[str, Any]] = []
+        for m in messages:
+            msg = Message.from_dict(m)
+            formatted_messages.append(msg.to_dict_with_none())
+        
+        # Log initial messages
+        chat_logger.log_messages(formatted_messages)
+        
+        # Create initial state
+        initial_state: AgentState = {
+            StateKeys.MESSAGES: formatted_messages,
+            StateKeys.CONTEXT: context.to_dict(),
+            StateKeys.FINAL_REPORT: None
+        }
+        
+        # Event queue for streaming
+        events_to_send: List[StreamEvent] = []
+        
+        def event_callback(event: StreamEvent):
+            """Callback to collect events during graph execution."""
+            events_to_send.append(event)
+        
+        # Set callback for this streaming session
+        self._event_callback = event_callback
+        
+        try:
+            # Run the agent graph (using invoke, but with event callback)
+            # Note: LangGraph's stream() doesn't work well with our tool pattern,
+            # so we use invoke with callbacks instead
+            result = self.graph.invoke(
+                initial_state,
+                config={"recursion_limit": 50}
+            )
+            
+            # Send all collected events
+            for event in events_to_send:
+                yield event.to_sse()
+            
+            # Send completion event
+            completion_event = StreamEvent(
+                event_type="complete",
+                data={
+                    "message": "Research complete",
+                    "context": result.get(StateKeys.CONTEXT),
+                    "messages": result.get(StateKeys.MESSAGES)
+                }
+            )
+            yield completion_event.to_sse()
+            
+            logger.info(f"📝 Chat log: {chat_logger.get_session_file()}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error in streaming research: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            
+            # Send error event
+            error_event = StreamEvent(
+                event_type="error",
+                data={"error": str(e)}
+            )
+            yield error_event.to_sse()
+        
+        finally:
+            # Clear callback
+            self._event_callback = None
 
 
 def main():

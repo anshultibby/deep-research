@@ -3,6 +3,7 @@ import logging
 import traceback
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any
 
@@ -104,6 +105,49 @@ async def research(request: ResearchRequest):
     
     except Exception as e:
         logger.error(f"❌ Error in research endpoint: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/research/stream")
+async def research_stream(request: ResearchRequest):
+    """Run research with Server-Sent Events streaming."""
+    try:
+        logger.info(f"📥 Received streaming research request: {request.query[:100]}...")
+        
+        # Build messages list
+        messages = request.messages if request.messages else [
+            {"role": "user", "content": request.query}
+        ]
+        logger.info(f"📨 Messages count: {len(messages)}")
+        
+        # Create streaming response
+        def event_generator():
+            try:
+                logger.info("🤖 Starting streaming research agent...")
+                for sse_event in agent.research_stream(messages):
+                    yield sse_event
+                logger.info("✅ Streaming research complete")
+            except Exception as e:
+                logger.error(f"❌ Error in streaming: {str(e)}")
+                logger.error(traceback.format_exc())
+                # Send error event
+                import json
+                error_sse = f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+                yield error_sse
+        
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"  # Disable nginx buffering
+            }
+        )
+    
+    except Exception as e:
+        logger.error(f"❌ Error in streaming research endpoint: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 

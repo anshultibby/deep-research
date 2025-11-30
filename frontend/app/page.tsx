@@ -41,6 +41,8 @@ export default function Home() {
   const [checklist, setChecklist] = useState<Record<string, ChecklistItem>>({})
   const [sources, setSources] = useState<Source[]>([])
   const [finalReport, setFinalReport] = useState<string | null>(null)
+  const [activityLog, setActivityLog] = useState<Array<{type: string, data: any}>>([])
+  const [useStreaming, setUseStreaming] = useState(true) // Toggle for streaming vs non-streaming
 
   // Helper to render clickable citations
   const renderCitation = (citationNumber: string) => {
@@ -61,12 +63,142 @@ export default function Home() {
     )
   }
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmitStreaming = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!query.trim()) return
 
     setLoading(true)
     setFinalReport(null)
+    setActivityLog([])
+    setChecklist({})
+    setSources([])
+
+    try {
+      const eventSource = new EventSource(
+        `http://localhost:8000/api/research/stream?${new URLSearchParams({
+          query,
+        })}`
+      )
+
+      // We'll send query via POST body instead, so we need fetch
+      eventSource.close()
+
+      // Use fetch for POST with SSE
+      const response = await fetch('http://localhost:8000/api/research/stream', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query, messages: [] }),
+      })
+
+      if (!response.ok) {
+        throw new Error('Failed to start research')
+      }
+
+      const reader = response.body?.getReader()
+      const decoder = new TextDecoder()
+
+      if (!reader) {
+        throw new Error('No response body')
+      }
+
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        
+        // Keep the last incomplete line in the buffer
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          if (line.startsWith('event:')) {
+            const eventType = line.substring(6).trim()
+            continue
+          }
+          
+          if (line.startsWith('data:')) {
+            const data = JSON.parse(line.substring(5).trim())
+            
+            // Get the event type from the previous line or from data
+            const lastLine = lines[lines.indexOf(line) - 1]
+            const eventType = lastLine?.startsWith('event:') 
+              ? lastLine.substring(6).trim() 
+              : 'unknown'
+
+            // Handle different event types
+            handleStreamEvent(eventType, data)
+          }
+        }
+      }
+
+    } catch (error) {
+      console.error('Error:', error)
+      alert('Error running research. Make sure the API is running.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleStreamEvent = (eventType: string, data: any) => {
+    console.log('Stream event:', eventType, data)
+
+    switch (eventType) {
+      case 'tool_call_started':
+        setActivityLog(prev => [...prev, {
+          type: 'started',
+          data: { tool_name: data.tool_name, tool_call_id: data.tool_call_id }
+        }])
+        break
+
+      case 'tool_call_completed':
+        setActivityLog(prev => [...prev, {
+          type: 'completed',
+          data: { tool_name: data.tool_name, success: data.success }
+        }])
+        break
+
+      case 'checklist_updated':
+        setChecklist(data.items)
+        break
+
+      case 'source_discovered':
+        setSources(prev => [...prev, ...data.sources])
+        break
+
+      case 'final_report':
+        setFinalReport(data.report)
+        break
+
+      case 'complete':
+        setMessages(data.messages || [])
+        if (data.context?.checklist) {
+          setChecklist(data.context.checklist)
+        }
+        if (data.context?.sources) {
+          setSources(data.context.sources)
+        }
+        break
+
+      case 'error':
+        console.error('Stream error:', data.error)
+        alert(`Error: ${data.error}`)
+        break
+    }
+  }
+
+  const handleSubmitNonStreaming = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!query.trim()) return
+
+    setLoading(true)
+    setFinalReport(null)
+    setActivityLog([])
 
     try {
       const response = await axios.post('http://localhost:8000/api/research', {
@@ -85,6 +217,8 @@ export default function Home() {
       setLoading(false)
     }
   }
+
+  const handleSubmit = useStreaming ? handleSubmitStreaming : handleSubmitNonStreaming
 
   const checklistItems = Object.values(checklist)
   const completedCount = checklistItems.filter(item => item.status === 'completed').length
@@ -105,7 +239,7 @@ export default function Home() {
         {/* Search Input */}
         <div className="mb-8">
           <form onSubmit={handleSubmit} className="max-w-3xl mx-auto">
-            <div className="flex gap-3">
+            <div className="flex gap-3 mb-3">
               <input
                 type="text"
                 value={query}
@@ -120,6 +254,15 @@ export default function Home() {
                 className="px-8 py-4 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:cursor-not-allowed text-white font-semibold transition-colors text-lg"
               >
                 {loading ? 'Researching...' : 'Research'}
+              </button>
+            </div>
+            <div className="flex justify-center">
+              <button
+                type="button"
+                onClick={() => setUseStreaming(!useStreaming)}
+                className="text-sm text-gray-400 hover:text-gray-300 transition-colors"
+              >
+                {useStreaming ? '🔄 Real-time updates (SSE)' : '⏸️ Wait for results'} • Click to toggle
               </button>
             </div>
           </form>
@@ -256,27 +399,54 @@ export default function Home() {
                 </h2>
                 
                 <div className="space-y-1.5 max-h-64 overflow-y-auto">
-                  {messages.map((msg, idx) => {
-                    if (msg.role === 'assistant' && msg.tool_calls) {
-                      return msg.tool_calls.map((tc, tcIdx) => (
-                        <div key={`${idx}-${tcIdx}`} className="p-2 bg-blue-900/40 rounded border border-blue-700">
-                          <p className="text-xs text-blue-300 font-mono">
-                            🤖 {tc.function.name}
-                          </p>
-                        </div>
-                      ))
-                    }
-                    if (msg.role === 'tool' && msg.name) {
-                      return (
-                        <div key={idx} className="p-2 bg-green-900/40 rounded border border-green-700">
-                          <p className="text-xs text-green-300 font-mono">
-                            ✓ {msg.name}
-                          </p>
-                        </div>
-                      )
-                    }
-                    return null
-                  })}
+                  {useStreaming && activityLog.length > 0 ? (
+                    // Show real-time activity log from streaming
+                    activityLog.map((activity, idx) => (
+                      <div 
+                        key={idx}
+                        className={`p-2 rounded border ${
+                          activity.type === 'started' 
+                            ? 'bg-blue-900/40 border-blue-700'
+                            : activity.data.success
+                            ? 'bg-green-900/40 border-green-700'
+                            : 'bg-red-900/40 border-red-700'
+                        }`}
+                      >
+                        <p className="text-xs font-mono">
+                          {activity.type === 'started' ? (
+                            <span className="text-blue-300">🔧 {activity.data.tool_name}</span>
+                          ) : (
+                            <span className={activity.data.success ? 'text-green-300' : 'text-red-300'}>
+                              {activity.data.success ? '✓' : '✗'} {activity.data.tool_name}
+                            </span>
+                          )}
+                        </p>
+                      </div>
+                    ))
+                  ) : (
+                    // Fallback to message-based activity log
+                    messages.map((msg, idx) => {
+                      if (msg.role === 'assistant' && msg.tool_calls) {
+                        return msg.tool_calls.map((tc, tcIdx) => (
+                          <div key={`${idx}-${tcIdx}`} className="p-2 bg-blue-900/40 rounded border border-blue-700">
+                            <p className="text-xs text-blue-300 font-mono">
+                              🤖 {tc.function.name}
+                            </p>
+                          </div>
+                        ))
+                      }
+                      if (msg.role === 'tool' && msg.name) {
+                        return (
+                          <div key={idx} className="p-2 bg-green-900/40 rounded border border-green-700">
+                            <p className="text-xs text-green-300 font-mono">
+                              ✓ {msg.name}
+                            </p>
+                          </div>
+                        )
+                      }
+                      return null
+                    })
+                  )}
                 </div>
               </div>
             </div>

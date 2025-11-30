@@ -2,51 +2,66 @@
 
 Context Injection Pattern:
 --------------------------
-Tools are decorated with @tool_with_context which:
-1. Allows tools to accept a 'context' parameter
-2. Excludes 'context' from the LLM schema (OpenAI doesn't see it)
-3. Context is injected at execution time by tool_handlers.py
+All tools accept a 'context: AgentContext' parameter that is:
+1. Injected at execution time by tool_handlers.py
+2. Excluded from the LLM schema (OpenAI doesn't see it)
+3. Available to any tool that needs it (tools can ignore it if not needed)
 
-This keeps tool definitions clean and natural.
+The @tool_with_context decorator automatically:
+- Creates proper schema WITHOUT the context parameter
+- Allows the tool function to accept context at runtime
 """
 import os
 import requests
-import functools
-from typing import List, Annotated, Callable, Any
+import inspect
+from typing import List, Annotated, Callable, get_type_hints
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_core.tools import tool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 from bs4 import BeautifulSoup
 import config  # Load environment variables
 from models import AgentContext
 
 
 def tool_with_context(func: Callable) -> Callable:
-    """Decorator for tools that need context injection.
+    """Decorator that wraps @tool to exclude 'context' parameter from schema.
     
-    Wraps a function so:
-    - It can accept 'context: AgentContext' parameter
-    - Context is excluded from OpenAI schema
-    - Actual execution receives context from tool_handlers
+    This ensures the LLM doesn't see or try to provide the context parameter,
+    while allowing us to inject it at execution time.
     
-    Usage:
-        @tool_with_context
-        def my_tool(arg1: str, context: AgentContext) -> Result:
-            # Use context here
-            context.add_sources(...)
-            return Result(...)
+    Simplified approach:
+    1. Extract all parameters except 'context'
+    2. Build Pydantic schema from those parameters
+    3. Apply LangChain's @tool decorator
     """
-    # Wrapper just calls the original function
-    # Context will be injected by tool_handlers before calling
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        return func(*args, **kwargs)
+    sig = inspect.signature(func)
+    type_hints = get_type_hints(func)
     
-    # Mark wrapper that it needs context injection
-    wrapper._needs_context = True
+    # Build schema fields excluding 'context'
+    schema_fields = {}
+    for param_name, param in sig.parameters.items():
+        if param_name == 'context':
+            continue  # Skip context - will be injected at runtime
+        
+        annotation = type_hints.get(param_name, str)
+        
+        # Handle Annotated types (e.g., Annotated[str, "description"])
+        if hasattr(annotation, '__metadata__'):
+            base_type = annotation.__origin__
+            description = annotation.__metadata__[0] if annotation.__metadata__ else ""
+            schema_fields[param_name] = (base_type, Field(description=description))
+        else:
+            schema_fields[param_name] = (annotation, Field())
     
-    # Apply @tool decorator for LangChain
-    return tool(wrapper)
+    # Create Pydantic model for args schema (without context parameter)
+    ArgsSchema = create_model(
+        f'{func.__name__}_schema',
+        **schema_fields,
+        __config__=None
+    )
+    
+    # Apply @tool decorator with the generated schema
+    return tool(args_schema=ArgsSchema)(func)
 
 
 # Tool return models with display methods
@@ -260,9 +275,10 @@ def search(query: Annotated[str, "The search query to look up"], context: AgentC
     return SearchResult(results=formatted_results)
 
 
-@tool
+@tool_with_context
 def ask_clarification(
-    questions: Annotated[List[str], "List of 2-3 clarifying questions to ask the user"]
+    questions: Annotated[List[str], "List of 2-3 clarifying questions to ask the user"],
+    context: AgentContext
 ) -> ClarificationRequest:
     """Ask the user clarifying questions. Use ONLY at the beginning if the query is too vague. Pauses execution for user input."""
     return ClarificationRequest(questions=questions)
@@ -305,9 +321,10 @@ def write_subreport(
     return SubreportComplete(item_id=item_id, findings=findings, source_urls=source_urls)
 
 
-@tool
+@tool_with_context
 def write_final_report(
-    final_report: Annotated[str, "The complete research report with citations"]
+    final_report: Annotated[str, "The complete research report with citations"],
+    context: AgentContext
 ) -> ResearchComplete:
     """Write the final research report that synthesizes all findings with proper citations. This completes the research."""
     return ResearchComplete(final_report=final_report)

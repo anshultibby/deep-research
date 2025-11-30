@@ -397,6 +397,7 @@ class LLMResponseMetadata(BaseModel):
 
 class EventTypes:
     """Constants for SSE event types."""
+    AGENT_REASONING = "agent_reasoning"
     TOOL_CALL_STARTED = "tool_call_started"
     TOOL_CALL_COMPLETED = "tool_call_completed"
     CHECKLIST_UPDATED = "checklist_updated"
@@ -415,6 +416,19 @@ class StreamEvent(BaseModel):
         """Convert to SSE format: event: type\ndata: json\n\n"""
         import json
         return f"event: {self.event_type}\ndata: {json.dumps(self.data)}\n\n"
+
+
+class AgentReasoningEvent(BaseModel):
+    """Event emitted when agent produces reasoning text."""
+    content: str
+    
+    def to_stream_event(self) -> StreamEvent:
+        return StreamEvent(
+            event_type=EventTypes.AGENT_REASONING,
+            data={
+                "content": self.content
+            }
+        )
 
 
 class ToolCallStartedEvent(BaseModel):

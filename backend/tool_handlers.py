@@ -7,7 +7,7 @@ import logging
 from typing import Tuple, Dict, Any, List, Generator, Optional
 from models import (
     AgentContext, StateKeys, ToolNames, Message,
-    ToolCallStartedEvent, ToolCallCompletedEvent,
+    ToolCallCompletedEvent,
     ChecklistUpdatedEvent, SourceDiscoveredEvent,
     StreamEvent
 )
@@ -113,19 +113,15 @@ def execute_tool_calls(
         # Execute tool with context
         logger.info(f"  → Executing {function_name} with args: {list(arguments.keys())}")
         
-        # Emit tool started event
-        if event_callback:
-            started_event = ToolCallStartedEvent(
-                tool_name=function_name,
-                tool_call_id=tool_call["id"],
-                arguments={k: v for k, v in arguments.items() if k != 'context'}  # Don't send context
-            )
-            event_callback(started_event.to_stream_event())
-        
         try:
             # Track context state before tool execution
             sources_before = len(context.sources)
             checklist_items_before = set(context.checklist.items.keys())
+            # Deep copy checklist state to detect changes in findings/status
+            checklist_state_before = {
+                item_id: (item.status, item.findings)
+                for item_id, item in context.checklist.items.items()
+            }
             
             display_message, additional_updates = execute_tool_with_context(
                 tool_func, function_name, arguments, context
@@ -143,18 +139,37 @@ def execute_tool_calls(
                     )
                     event_callback(source_event.to_stream_event())
                 
-                # Check for checklist changes
+                # Check for checklist changes (new items OR status/findings updates)
                 checklist_items_after = set(context.checklist.items.keys())
+                checklist_state_after = {
+                    item_id: (item.status, item.findings)
+                    for item_id, item in context.checklist.items.items()
+                }
+                
+                checklist_changed = False
+                action = "updated"
+                affected_ids = []
+                
+                # Check for new or removed items
                 if checklist_items_after != checklist_items_before:
+                    checklist_changed = True
                     new_items = checklist_items_after - checklist_items_before
                     if new_items:
                         action = "added"
                         affected_ids = list(new_items)
                     else:
-                        # Check for status changes
-                        action = "updated"
                         affected_ids = list(checklist_items_before)
-                    
+                
+                # Check for status/findings changes in existing items
+                elif checklist_state_after != checklist_state_before:
+                    checklist_changed = True
+                    # Find which items changed
+                    for item_id in checklist_items_before:
+                        if checklist_state_before[item_id] != checklist_state_after.get(item_id):
+                            affected_ids.append(item_id)
+                
+                # Emit checklist update event if anything changed
+                if checklist_changed:
                     checklist_event = ChecklistUpdatedEvent(
                         items=context.checklist.to_dict(),
                         action=action,

@@ -127,6 +127,8 @@ Write a well-structured report (3-5 paragraphs) that:
 4. Draws meaningful conclusions
 5. Cites sources where appropriate using [source_id] notation
 
+DONT CLARIFY WITH THE USER AT ALL AS THEY HAVE NO WAY TO RESPOND TO YOU.
+
 Report:""")
 
 

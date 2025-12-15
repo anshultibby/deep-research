@@ -300,4 +300,4 @@ def write_final_report(
 # Helper to get all tools as a list
 def get_all_tools():
     """Return all tools for the agent."""
-    return [search, ask_clarification, get_current_checklist, modify_checklist, write_subreport, write_final_report]
+    return [search, get_current_checklist, modify_checklist, write_subreport, write_final_report]

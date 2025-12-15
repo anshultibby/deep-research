@@ -1,301 +1,40 @@
 # Deep Research Agent - Design Document
 
-## Overview
+## Overall Architecture
 
-An intelligent deep research agent built with LangGraph that uses **checklist-based planning** and **parallel research execution** for efficient, comprehensive research.
+Straightforward toolcalling agent with a few tools to perform websearch in a systematic way.
 
-## Key Design Decisions
+tools:
+1. Search - uses serper API to search on google and return URLs, titles and content which is scraped using the helper function for scraping
+2. Modify_checklist - main planning tool which allows agent to write or update a research checklist item
+3. Get_currrent_checklist - Gets the state of the current checklist as pending/completed items
+4. Write subreport - note taking tool which allows an agent to fulfil individual checklist items. Can support with citations.
+5. Write final report - write final report tool which synthesizes all the data and puts the citations together. Also ends the research call.
 
-### 1. Messages-First Architecture ✅
+### System architecture description
+Built a very simple backend in fastapi and a frontend using nextjs to try out the agent. I have a streaming system using SSE to emit tool calls and checklist items as the LLM makes them. I am storing the entire chat in the backend as a json so that I can review the flow and figure out if behaviour matches what I expect (didn't use Langgraph and more sophisticated tracing methods just because of time constraints but I have tried it in past)
 
-**Requirement:** State must have a `messages` field where users input requests and receive responses.
 
-**Implementation:**
-```python
-class AgentState(TypedDict):
-    messages: Annotated[list[Message], operator.add]  # Primary interface
-    checklist: list[dict]  # Research items to resolve
-    iteration_count: int   # Track iterations
-```
+## Activity log:
+a1. I started with my basic agent design to see if it will be good enough. This is pretty close to the starting design and I am happy with it! My first time trying out langchain stategraph and it is pretty clean api.
+a2. For tools I have a notion of context variables, I think in langchain these are just like injected_vars for the tool. I am a fan of these as they allow me to send info such as chat_id, user_id through code without needing to involve the LLM.
+a3. I truncated the content that is scraped and also the scraper is very rudimentary just using bs4 so the quality of the final output may not be so high. I can increase these limits for higher quality answers.
 
-**Why:** 
-- Follows LangGraph best practices
-- Compatible with standard chat interfaces
-- Full conversation history with tool calls
-- Easy to integrate with existing systems
+b. I have an extra tool call ask_clarification but it was gonna take too long to stream the intermediate response to the user and wait for their input so I removed it from final version. I guess this means that I didn't build a chat agent just a single shot deepresearch agent. This could be a big shortcoming but it is not at all difficult to convert this into a chat agent by just adding the user message to conversation list and then sending it to the llm again.
 
-### 2. Intelligent Clarification
+c. Most things worked pretty well from my inital design. It was a little bit tricky to get streaming working but I looked through langchain's repo and found the SSE style architecture very neat so I just copied it using cursor for my agent.
 
-**Feature:** Agent analyzes queries and asks 2-3 clarifying questions when needed.
+## Shortcomings:
+1. Scraping is rudimentary - can run into bot detection sort of issues and no intelligent parsing of content. Can solve by using a better API which supports all this from out of the box
+2. Agent research loop is pretty short. It can use more reflection steps and propmt to guide it and help it decide when to add more checklist items after going through an initial set of them vs calling it a day.
+3. All sources just exist in chat context. This can easily cause bloat. Would be better to implement the resource idea from MCP so that we can pull in results and then look through them systematically via grep and reading chunks.
+4. The tool implementation is a bit bespoke, I use the langchain tool prior but modify it slightly. I am also not sure about the relationship between MCP and Langchain's priors.
 
-**When it triggers:**
-- Query is too broad or ambiguous
-- Timeframe is missing for time-sensitive topics
-- Multiple interpretations possible
-- Domain context would significantly improve research
 
-**Benefits:**
-- Better focused research
-- More relevant results
-- Saves tokens by avoiding irrelevant searches
-
-### 3. Checklist-Based Planning
-
-**Core Concept:** Instead of sequential steps, create a **research checklist** of items that need resolution.
-
-**Pydantic Models:**
-```python
-class ChecklistItem(BaseModel):
-    id: str
-    question: str
-    resolved: bool
-    findings: Optional[ItemFindings]
-
-class ItemFindings(BaseModel):
-    summary: str
-    sources: List[SearchResult]
-    key_points: List[str]
-
-class ResearchChecklist(BaseModel):
-    items: List[ChecklistItem]
-    iteration_count: int
-```
-
-**Benefits:**
-- Clear tracking of what's resolved vs. pending
-- Structured findings with sources
-- Easy to visualize progress
-
-### 4. Five-Stage Workflow with Iteration
-
-```
-User Query
-    ↓
-[1. Clarify] (optional pause for user input)
-    ↓
-[2. Create Checklist] (LLM breaks down into items)
-    ↓
-    ┌─────────────────┐
-    │  ITERATION LOOP │
-    └─────────────────┘
-         ↓
-[3. Plan Parallel] (LLM decides which items can run in parallel)
-         ↓
-[4. Execute Research] (Research all unresolved items in parallel)
-         ↓
-[5. Evaluate Progress] (Check if more iterations needed)
-         ↓
-    Continue? → YES → back to Plan Parallel
-         ↓ NO
-[6. Synthesize Report] (Generate final comprehensive report)
-         ↓
-    Final Report
-```
-
-**Stages:**
-
-1. **Clarify** 
-   - LLM analyzes query
-   - Decides if clarification needed
-   - Returns questions or proceeds
-   - Can pause workflow for user input
-
-2. **Plan**
-   - Breaks query into N sub-questions
-   - Creates focused research steps
-   - Each step targets specific information
-
-3. **Research** (loops)
-   - For each sub-question:
-     - Search Google via Serper.dev
-     - Get top 3 results
-     - LLM summarizes findings
-   - Records as tool messages
-   - Loops until all steps complete
-
-4. **Synthesize**
-   - Combines all findings
-   - LLM writes comprehensive report
-   - Returns as assistant message
-
-### 4. Message Types
-
-**User Messages:** Input queries and clarification responses
-
-**Assistant Messages:**
-- Clarifying questions
-- Research plan
-- **Final report** (last assistant message)
-
-**Tool Messages:**
-- `web_search`: Search operations
-- `search_results`: Findings with URLs and summaries
-
-**System Messages:** Internal state updates (optional, for debugging)
-
-### 5. Dual Interface
-
-**Primary: Messages-based**
-```python
-messages = [{"role": "user", "content": "query"}]
-result = agent.research(messages)
-# Returns full state with messages list
-```
-
-**Secondary: Simple string**
-```python
-response = agent.research_simple("query")
-# Returns just the response string
-```
-
-## Technical Stack
-
-- **LangGraph**: State machine orchestration
-- **LiteLLM**: Unified LLM interface (supports GPT-5, Claude, etc.)
-- **Serper.dev**: Google search API
-- **Pydantic**: Data validation (models.py)
-
-## State Management
-
-### State Fields
-
-```python
-messages: list[Message]           # Conversation history (required)
-needs_clarification: bool         # Pause flag
-clarifying_questions: list[str]   # Questions for user
-plan: list[dict]                  # Research steps
-current_step: int                 # Progress tracker
-```
-
-### State Flow
-
-1. User creates initial state with user message
-2. Each node transforms state by:
-   - Reading from messages and other fields
-   - Appending new messages
-   - Updating internal tracking fields
-3. Final state contains complete message history
-4. User extracts final report from last assistant message
-
-## LLM Calls
-
-**Total per research: 4 + N** (where N = max_steps)
-
-1. Clarification analysis (1 call)
-2. Planning (1 call)
-3. Summarize each search result (N calls)
-4. Final synthesis (1 call)
-
-**Token optimization:**
-- Concise prompts
-- Summarize search results (don't pass raw HTML)
-- Only pass relevant context to synthesis
-
-## Web Search Strategy
-
-**Per research step:**
-- Query: Sub-question from plan
-- Results: Top 3 organic results
-- Data extracted: Title, URL, snippet
-- LLM summarizes: 2-3 sentence key points
-
-**Why top 3?**
-- Balance between coverage and cost
-- Reduces noise
-- Faster execution
-
-## Error Handling
-
-- Invalid API keys: Raise on initialization
-- Search failures: Skip step, note in tool message
-- LLM failures: Retry once, fall back to "unavailable"
-- Empty results: Note in summary, continue
-
-## Example Use Cases
-
-### 1. Technical Research
-Query: "How does GPT-4's attention mechanism differ from GPT-3?"
-- No clarification (specific query)
-- Plan: Architecture changes, performance impact, implementation details
-- Synthesize: Technical comparison with evidence
-
-### 2. Broad Exploration
-Query: "Tell me about AI"
-- Needs clarification
-- Asks: domain, timeframe, depth
-- User responds: "LLMs, 2024, business use"
-- Adjusted plan based on context
-
-### 3. Current Events
-Query: "What happened with OpenAI this week?"
-- Clarification: Which week? Which aspects?
-- Or if clear: Direct research on recent news
-
-## Future Enhancements
-
-Potential improvements (not implemented):
-
-1. **Streaming**: Stream assistant responses
-2. **Source ranking**: Weight sources by credibility
-3. **Multi-turn research**: Allow follow-up questions
-4. **Caching**: Cache search results
-5. **Parallel search**: Run searches concurrently
-6. **Human-in-loop**: Let user approve plan before searching
-7. **Fact checking**: Cross-reference claims
-8. **Citation format**: Structured references
-
-## Code Quality
-
-- Type hints throughout
-- Docstrings for public methods
-- Pydantic models for data validation
-- Clean separation of concerns
-- No hardcoded values (configurable)
-- Error messages are informative
-
-## Testing Approach
-
-Manual testing scenarios:
-
-1. Specific query (no clarification)
-2. Broad query (needs clarification)
-3. Multi-turn with clarification
-4. Edge cases (empty query, very long query)
-5. API failures (invalid keys)
-
-## Performance
-
-Typical execution:
-- Clarification: ~2s
-- Planning: ~2s
-- Research (3 steps): ~15s (5s per step)
-- Synthesis: ~5s
-- **Total: ~25s for complete research**
-
-With clarification: +2s for question generation
-
-## Compliance with Requirements
-
-✅ Has `messages` field in state  
-✅ Users input via messages  
-✅ Final report returned as assistant message  
-✅ Tool calls stored in messages  
-✅ Uses web search API (Serper.dev)  
-✅ Returns grounded report  
-✅ Built with LangGraph  
-✅ Original implementation (not copied)  
-✅ Clean code structure  
-✅ Documented and explained  
-
-## Summary
-
-This is a **simple but effective** deep research agent that:
-- Follows LangGraph best practices with messages-based state
-- Intelligently asks clarifying questions when needed
-- Breaks down complex queries into focused research steps
-- Grounds all findings in web search results
-- Returns comprehensive, synthesized reports
-- Provides full transparency via message history
-
-The design prioritizes **simplicity, clarity, and correctness** over advanced features.
-
+## Things I will add:
+1. Evals on a widesearch dataset
+2. A tool for scraping content from a specific url. Usecase is to allow LLM to step into some of the inital webpages it finds using Serper.
+3. Coding capabilities. I will add a couple coding tools (write file, run code) and a virtualized file system. Coding is a very effective way for LLM to do analysis and LLMs are great at writing code. Also Anthropic seems to recommend code first methodology so as to improve security of the application and reduce token usage
+4. Full chat agent system
+5. MCP support? nice to have for user to add any mcp that they may want easily
+6. Multi agent architecture? - One way to implement is to think of our main chat agent as the orchestrator. Each time it creates a checklist item it can create a subagent to address that checklist item. Main agent can use MCP resources to work with outputs from individual subagents. This can immediately increase the complexity of search plan and hopefully let us tackle topics that are too large to fit into a single agent's context.

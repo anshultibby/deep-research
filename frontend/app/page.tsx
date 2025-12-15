@@ -43,6 +43,8 @@ export default function Home() {
   const [finalReport, setFinalReport] = useState<string | null>(null)
   const [activityLog, setActivityLog] = useState<Array<{type: string, data: any}>>([])
   const [useStreaming, setUseStreaming] = useState(true) // Toggle for streaming vs non-streaming
+  const [expandedChecklistItems, setExpandedChecklistItems] = useState<Set<string>>(new Set())
+  const [expandedReasoningItems, setExpandedReasoningItems] = useState<Set<number>>(new Set())
 
   // Helper to render clickable citations
   const renderCitation = (citationNumber: string) => {
@@ -63,6 +65,20 @@ export default function Home() {
     )
   }
 
+  // Helper to toggle checklist item expansion
+  const toggleChecklistItem = (itemId: string) => {
+    setExpandedChecklistItems(prev => {
+      const newSet = new Set(prev)
+      if (newSet.has(itemId)) {
+        newSet.delete(itemId)
+      } else {
+        newSet.add(itemId)
+      }
+      return newSet
+    })
+  }
+
+
   const handleSubmitStreaming = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!query.trim()) return
@@ -72,6 +88,8 @@ export default function Home() {
     setActivityLog([])
     setChecklist({})
     setSources([])
+    setExpandedChecklistItems(new Set())
+    setExpandedReasoningItems(new Set())
 
     try {
       const eventSource = new EventSource(
@@ -104,6 +122,7 @@ export default function Home() {
       }
 
       let buffer = ''
+      let currentEventType = 'unknown'
 
       while (true) {
         const { done, value } = await reader.read()
@@ -118,21 +137,15 @@ export default function Home() {
 
         for (const line of lines) {
           if (line.startsWith('event:')) {
-            const eventType = line.substring(6).trim()
-            continue
-          }
-          
-          if (line.startsWith('data:')) {
-            const data = JSON.parse(line.substring(5).trim())
-            
-            // Get the event type from the previous line or from data
-            const lastLine = lines[lines.indexOf(line) - 1]
-            const eventType = lastLine?.startsWith('event:') 
-              ? lastLine.substring(6).trim() 
-              : 'unknown'
-
-            // Handle different event types
-            handleStreamEvent(eventType, data)
+            currentEventType = line.substring(6).trim()
+          } else if (line.startsWith('data:')) {
+            try {
+              const data = JSON.parse(line.substring(5).trim())
+              handleStreamEvent(currentEventType, data)
+              currentEventType = 'unknown' // Reset after handling
+            } catch (e) {
+              console.error('Failed to parse SSE data:', e)
+            }
           }
         }
       }
@@ -149,17 +162,33 @@ export default function Home() {
     console.log('Stream event:', eventType, data)
 
     switch (eventType) {
+      case 'agent_reasoning':
+        setActivityLog(prev => [...prev, {
+          type: 'reasoning',
+          data: { 
+            content: data.content
+          }
+        }])
+        break
+
       case 'tool_call_started':
         setActivityLog(prev => [...prev, {
           type: 'started',
-          data: { tool_name: data.tool_name, tool_call_id: data.tool_call_id }
+          data: { 
+            tool_name: data.tool_name, 
+            tool_call_id: data.tool_call_id,
+            arguments: data.arguments 
+          }
         }])
         break
 
       case 'tool_call_completed':
         setActivityLog(prev => [...prev, {
           type: 'completed',
-          data: { tool_name: data.tool_name, success: data.success }
+          data: { 
+            tool_name: data.tool_name, 
+            success: data.success 
+          }
         }])
         break
 
@@ -199,6 +228,8 @@ export default function Home() {
     setLoading(true)
     setFinalReport(null)
     setActivityLog([])
+    setExpandedChecklistItems(new Set())
+    setExpandedReasoningItems(new Set())
 
     try {
       const response = await axios.post('http://localhost:8000/api/research', {
@@ -369,24 +400,81 @@ export default function Home() {
                   </span>
                 </div>
                 
-                <div className="space-y-2 max-h-64 overflow-y-auto">
-                  {checklistItems.map((item) => (
-                    <div
-                      key={item.id}
-                      className={`p-2 rounded-lg ${
-                        item.status === 'completed'
-                          ? 'bg-green-900/30 border border-green-700'
-                          : 'bg-gray-700/50 border border-gray-600'
-                      }`}
-                    >
-                      <div className="flex items-start gap-2">
-                        <span className="text-xs">
-                          {item.status === 'completed' ? '✅' : '⏳'}
-                        </span>
-                        <p className="text-gray-300 text-xs leading-relaxed flex-1">{item.question}</p>
+                <div className="space-y-2 max-h-96 overflow-y-auto">
+                  {checklistItems.length === 0 ? (
+                    <p className="text-gray-500 text-xs text-center py-4">No items yet</p>
+                  ) : (
+                    checklistItems.map((item, idx) => (
+                      <div
+                        key={item.id}
+                        className={`rounded-lg border ${
+                          item.status === 'completed'
+                            ? 'bg-green-900/20 border-green-700'
+                            : 'bg-gray-700/30 border-gray-600'
+                        }`}
+                      >
+                        {/* Item header - clickable if has findings */}
+                        <div
+                          onClick={() => item.findings && toggleChecklistItem(item.id)}
+                          className={`p-2 flex items-start gap-2 ${
+                            item.findings ? 'cursor-pointer hover:bg-gray-700/30' : ''
+                          }`}
+                        >
+                          <span className="text-xs flex-shrink-0">
+                            {item.status === 'completed' ? '✅' : '⏳'}
+                          </span>
+                          <p className="text-gray-300 text-xs leading-relaxed flex-1">
+                            {item.question}
+                          </p>
+                          {item.findings && (
+                            <span className="text-gray-500 text-xs flex-shrink-0">
+                              {expandedChecklistItems.has(item.id) ? '▼' : '▶'}
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Expandable findings */}
+                        {item.findings && expandedChecklistItems.has(item.id) && (
+                          <div className="px-2 pb-2 border-t border-gray-600/50 mt-1">
+                            <div className="mt-2 bg-gray-900/40 rounded p-2 border border-gray-700">
+                              <p className="text-[10px] font-semibold text-gray-400 mb-1">
+                                Findings:
+                              </p>
+                              <div className="text-xs text-gray-300 leading-relaxed whitespace-pre-wrap">
+                                {item.findings}
+                              </div>
+                            </div>
+                            {item.source_ids && item.source_ids.length > 0 && (
+                              <div className="mt-2">
+                                <p className="text-[10px] text-gray-500 mb-1">
+                                  Sources: {item.source_ids.length}
+                                </p>
+                                <div className="flex flex-wrap gap-1">
+                                  {item.source_ids.map((sourceId) => (
+                                    <a
+                                      key={sourceId}
+                                      href={`#source-${sourceId.replace('source_', '')}`}
+                                      onClick={(e) => {
+                                        e.preventDefault()
+                                        const id = sourceId.replace('source_', '')
+                                        document.getElementById(`source-${id}`)?.scrollIntoView({
+                                          behavior: 'smooth',
+                                          block: 'center'
+                                        })
+                                      }}
+                                      className="text-blue-400 hover:text-blue-300 text-[10px] font-mono"
+                                    >
+                                      [{sourceId.replace('source_', '')}]
+                                    </a>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
-                    </div>
-                  ))}
+                    ))
+                  )}
                 </div>
               </div>
             </div>
@@ -401,20 +489,86 @@ export default function Home() {
                 <div className="space-y-1.5 max-h-64 overflow-y-auto">
                   {useStreaming && activityLog.length > 0 ? (
                     // Show real-time activity log from streaming
-                    activityLog.map((activity, idx) => (
-                      <div 
-                        key={idx}
-                        className={`p-2 rounded border ${
-                          activity.type === 'started' 
-                            ? 'bg-blue-900/40 border-blue-700'
-                            : activity.data.success
-                            ? 'bg-green-900/40 border-green-700'
-                            : 'bg-red-900/40 border-red-700'
-                        }`}
-                      >
-                        <p className="text-xs font-mono">
-                          {activity.type === 'started' ? (
-                            <span className="text-blue-300">🔧 {activity.data.tool_name}</span>
+                    activityLog.map((activity, idx) => {
+                      // Handle agent reasoning
+                      if (activity.type === 'reasoning') {
+                        const isExpanded = expandedReasoningItems.has(idx)
+                        const content = activity.data.content
+                        const preview = content.length > 80 ? content.substring(0, 80) + '...' : content
+                        
+                        return (
+                          <div 
+                            key={idx}
+                            className="rounded border bg-purple-900/30 border-purple-700"
+                          >
+                            <div 
+                              onClick={() => {
+                                const newSet = new Set(expandedReasoningItems)
+                                if (isExpanded) {
+                                  newSet.delete(idx)
+                                } else {
+                                  newSet.add(idx)
+                                }
+                                setExpandedReasoningItems(newSet)
+                              }}
+                              className="p-2 cursor-pointer hover:bg-purple-900/40 transition-colors"
+                            >
+                              <div className="flex items-start gap-2">
+                                <span className="text-xs text-purple-300">💭</span>
+                                <p className="text-xs text-purple-200 flex-1 leading-relaxed">
+                                  {isExpanded ? content : preview}
+                                </p>
+                                {content.length > 80 && (
+                                  <span className="text-purple-500 text-xs flex-shrink-0">
+                                    {isExpanded ? '▼' : '▶'}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        )
+                      }
+                      
+                      // Parse arguments if it's a JSON string
+                      let parsedArgs = null
+                      if (activity.type === 'started' && activity.data.arguments) {
+                        try {
+                          parsedArgs = JSON.parse(activity.data.arguments)
+                        } catch (e) {
+                          parsedArgs = activity.data.arguments
+                        }
+                      }
+
+                      return (
+                        <div 
+                          key={idx}
+                          className={`p-2 rounded border ${
+                            activity.type === 'started' 
+                              ? 'bg-blue-900/40 border-blue-700'
+                              : activity.data.success
+                              ? 'bg-green-900/40 border-green-700'
+                              : 'bg-red-900/40 border-red-700'
+                          }`}
+                        >
+                          <p className="text-xs font-mono">
+                            {activity.type === 'started' ? (
+                              <>
+                                <span className="text-blue-300">🔧 {activity.data.tool_name}</span>
+                                {parsedArgs && (
+                                  <span className="text-blue-200/60 block mt-1 text-[10px] leading-tight">
+                                    {typeof parsedArgs === 'object' 
+                                      ? Object.entries(parsedArgs).map(([key, value]) => {
+                                          // Truncate long values
+                                          const displayValue = typeof value === 'string' && value.length > 50
+                                            ? value.substring(0, 50) + '...'
+                                            : JSON.stringify(value)
+                                          return `${key}: ${displayValue}`
+                                        }).join(', ')
+                                      : String(parsedArgs)
+                                    }
+                                  </span>
+                                )}
+                              </>
                           ) : (
                             <span className={activity.data.success ? 'text-green-300' : 'text-red-300'}>
                               {activity.data.success ? '✓' : '✗'} {activity.data.tool_name}
@@ -422,7 +576,8 @@ export default function Home() {
                           )}
                         </p>
                       </div>
-                    ))
+                      )
+                    })
                   ) : (
                     // Fallback to message-based activity log
                     messages.map((msg, idx) => {
